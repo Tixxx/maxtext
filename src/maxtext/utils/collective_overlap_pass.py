@@ -1,0 +1,1223 @@
+"""Profile-guided POST_SCHEDULER pass: move async collective starts earlier.
+
+Phase 1 — schedule reordering:
+  For every async collective found in the scheduled HLO, use the PGLE FDO
+  profile to check whether ops between start and done are sufficient to fully
+  hide the collective's latency.  If not, move the start earlier (bounded by
+  data-dependency constraints).
+
+Phase 2 — split batched collectives:
+  If a collective still has a latency deficit after phase 1 (because it bundles
+  gradients from multiple layers and can't move due to deps), split it into
+  per-layer sub-collectives positioned right after their respective producers,
+  so each sub-collective overlaps with the next layer's backward GEMMs.
+
+Registration
+------------
+Call ``register()`` once before the first ``jax.jit``-compiled function runs.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.DEBUG)
+if not _logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setLevel(logging.DEBUG)
+    _h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    _logger.addHandler(_h)
+    _logger.propagate = False
+
+# ---------------------------------------------------------------------------
+# Shared mutable state: populated once PGLE delivers its FDO profile bytes
+# ---------------------------------------------------------------------------
+_profile_costs: dict[str, float] = {}
+
+# ---------------------------------------------------------------------------
+# Unified proto compilation (PGLE profile + XLA HLO module)
+# All protos compiled into one directory to avoid descriptor pool conflicts.
+# ---------------------------------------------------------------------------
+_XLA_SRC = os.environ.get("DEFAULT_XLA_PATH") or "/opt/xla"
+_TSL_SRC = f"{_XLA_SRC}/third_party/tsl"
+_PROTO_OUT_DIR = "/tmp/_collective_overlap_pass_proto"
+
+_PROTO_SOURCES = [
+    "tsl/profiler/protobuf/profiled_instructions.proto",
+    "xla/service/hlo.proto",
+    "xla/xla_data.proto",
+    "xla/service/metrics.proto",
+]
+
+_PROTO_INIT_DIRS = [
+    "",
+    "tsl", "tsl/profiler", "tsl/profiler/protobuf",
+    "xla", "xla/service",
+]
+
+
+def _ensure_protos():
+    """Compile all needed proto files once into a single output directory."""
+    marker = os.path.join(_PROTO_OUT_DIR, "xla", "service", "hlo_pb2.py")
+    if os.path.exists(marker):
+        if _PROTO_OUT_DIR not in sys.path:
+            sys.path.insert(0, _PROTO_OUT_DIR)
+        return
+    for rel in _PROTO_INIT_DIRS:
+        d = os.path.join(_PROTO_OUT_DIR, rel)
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "__init__.py"), "a").close()
+    subprocess.run(
+        ["protoc",
+         f"--proto_path={_TSL_SRC}",
+         f"--proto_path={_XLA_SRC}",
+         "--proto_path=/usr/local/include",
+         f"--python_out={_PROTO_OUT_DIR}",
+         *_PROTO_SOURCES],
+        check=True, capture_output=True,
+    )
+    if _PROTO_OUT_DIR not in sys.path:
+        sys.path.insert(0, _PROTO_OUT_DIR)
+
+
+def _load_costs_from_fdo(fdo_bytes: bytes) -> dict[str, float]:
+    _ensure_protos()
+    from tsl.profiler.protobuf import profiled_instructions_pb2 as _pi  # type: ignore
+    profiled = _pi.ProfiledInstructionsProto()
+    profiled.ParseFromString(fdo_bytes)
+    return {c.name: c.cost_us for c in profiled.costs}
+
+
+def _update_profile(fdo_bytes: bytes) -> None:
+    global _profile_loaded
+    if not fdo_bytes:
+        return
+    try:
+        costs = _load_costs_from_fdo(fdo_bytes)
+        if not costs:
+            return
+        _profile_costs.update(costs)
+        ag_count = sum(1 for k in costs if "all-gather" in k or "reduce-scatter" in k)
+        if ag_count > 0:
+            _profile_loaded = True
+            _logger.info(
+                "collective_overlap_pass: loaded PGLE profile with %d instruction "
+                "costs (%d collective entries); total pool now %d.",
+                len(costs), ag_count, len(_profile_costs),
+            )
+        else:
+            _logger.debug(
+                "collective_overlap_pass: merged profile chunk: %d entries, "
+                "0 collectives; total pool now %d.",
+                len(costs), len(_profile_costs),
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        _logger.warning("collective_overlap_pass: failed to parse FDO profile: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# POST_SCHEDULER pass — data structures
+# ---------------------------------------------------------------------------
+_ASYNC_DONE_PREFIXES = (
+    "all-gather-done.",
+    "reduce-scatter-done.",
+    "all-reduce-done.",
+    "collective-permute-done.",
+)
+
+# Minimum deficit (µs) to consider a collective for phase-2 splitting.
+# Override with COLLECTIVE_OVERLAP_DISABLE_SPLIT=1 to run baseline (no split).
+_SPLIT_DEFICIT_THRESHOLD_US = (
+    float("inf") if os.environ.get("COLLECTIVE_OVERLAP_DISABLE_SPLIT") == "1"
+    else 500.0
+)
+# Minimum number of operand groups to split.
+_SPLIT_MIN_GROUPS = 2
+# Typical number of operands per "layer epoch" in a batched collective.
+# 34 operands / 5 FFN layers ≈ 7 → 5 groups.  Used for rank-based grouping
+# when there are no natural position gaps between layers.
+_SPLIT_GROUP_SIZE = 7
+
+
+@dataclass
+class _SplitCandidate:
+    start_name: str
+    done_name: str
+    deficit_us: float
+    # effective_producer_pos[i] = schedule position of the 'real' producer
+    # (tracing through bitcasts/GTEs) for operand i of the async-start.
+    effective_producer_pos: list[int] = field(default_factory=list)
+
+
+def _is_async_done(inst: object) -> bool:
+    return any(inst.name.startswith(p) for p in _ASYNC_DONE_PREFIXES)
+
+
+_HEAVY_INPUT_BYTES = 8 * 1024 * 1024  # 8 MB threshold for fusion inputs
+
+# XLA PrimitiveType → bytes per element (xla_data.proto enum values)
+_PTYPE_BYTES: dict[int, int] = {
+    1: 1,                           # PRED
+    2: 1, 3: 2, 4: 4, 5: 8,        # S8/S16/S32/S64
+    6: 1, 7: 2, 8: 4, 9: 8,        # U8/U16/U32/U64
+    10: 2, 11: 4, 12: 8, 16: 2,    # F16/F32/F64/BF16
+    15: 8, 18: 16,                  # C64/C128
+    19: 1, 20: 1,                   # F8E5M2/F8E4M3FN
+}
+
+
+def _proto_shape_bytes(shape) -> int:
+    """Total bytes for an HloShapeProto (tuples summed recursively)."""
+    if shape.element_type == 13:  # TUPLE
+        return sum(_proto_shape_bytes(s) for s in shape.tuple_shapes)
+    n = 1
+    for d in shape.dimensions:
+        n *= d
+    return n * _PTYPE_BYTES.get(shape.element_type, 4)
+
+
+def _is_heavy_kernel_proto(inst, id_to_inst: dict) -> bool:
+    """True for cublas/cudnn custom-calls or large fusion ops (≥8 MB input).
+
+    These are SM-saturating kernels that can delay NIC startup for collectives
+    scheduled immediately after them.
+    """
+    if inst.opcode == "custom-call":
+        tgt = getattr(inst, "custom_call_target", "").lower()
+        return "cublas" in tgt or "cudnn" in tgt
+    if inst.opcode == "fusion":
+        total = sum(
+            _proto_shape_bytes(id_to_inst[oid].shape)
+            for oid in inst.operand_ids
+            if oid in id_to_inst
+        )
+        return total >= _HEAVY_INPUT_BYTES
+    return False
+
+
+def _is_heavy_kernel_inst(inst) -> bool:
+    """Phase-1 variant of _is_heavy_kernel_proto for C++ XLA instruction objects."""
+    opc = inst.opcode
+    if opc == "custom-call":
+        try:
+            tgt = inst.custom_call_target().lower()
+            return "cublas" in tgt or "cudnn" in tgt
+        except Exception:
+            pass
+    if opc == "fusion":
+        try:
+            total = sum(_shape_size_bytes(op.shape) for op in inst.operands())
+            return total >= _HEAVY_INPUT_BYTES
+        except Exception:
+            pass
+    return False
+
+
+def _shape_size_bytes(shape) -> int:
+    """Total bytes for an XLA Shape object (phase-1 C++ wrapper)."""
+    try:
+        if shape.is_tuple():
+            return sum(_shape_size_bytes(s) for s in shape.tuple_shapes())
+        n = 1
+        for d in shape.dimensions():
+            n *= d
+        return n * _PTYPE_BYTES.get(int(shape.element_type()), 4)
+    except Exception:
+        return 0
+
+
+def _effective_producer_pos(inst, positions: dict, max_depth: int = 8) -> int:
+    """Return the schedule position of inst's 'real' producer, looking through
+    zero-cost ops (bitcast, get-tuple-element, tuple) up to max_depth steps."""
+    _ZERO_COST = ("bitcast", "get-tuple-element", "tuple")
+    cur = inst
+    for _ in range(max_depth):
+        opc = cur.opcode
+        if opc not in _ZERO_COST:
+            break
+        ops = list(cur.operands())
+        if not ops or ops[0] not in positions:
+            break
+        cur = ops[0]
+    return positions.get(cur, positions.get(inst, 0))
+
+
+def _proto_effective_pos(
+    op_id: int,
+    id_to_inst: dict,
+    id_to_sched_pos: dict,
+    max_depth: int = 8,
+) -> int:
+    """Like _effective_producer_pos but works on proto instruction objects by ID.
+
+    Traces through zero-cost ops (bitcast, get-tuple-element, tuple) to find
+    the 'real' producer's schedule position in the CURRENT proto schedule.
+    Used by the split subprocess to avoid relying on stale phase-1 positions.
+    """
+    _ZERO_COST = ("bitcast", "get-tuple-element", "tuple")
+    cur_id = op_id
+    for _ in range(max_depth):
+        inst = id_to_inst.get(cur_id)
+        if inst is None or inst.opcode not in _ZERO_COST:
+            break
+        if not inst.operand_ids:
+            break
+        next_id = inst.operand_ids[0]
+        if next_id not in id_to_sched_pos:
+            break
+        cur_id = next_id
+    pos = id_to_sched_pos.get(cur_id)
+    if pos is None:
+        pos = id_to_sched_pos.get(op_id, 0)
+    return pos
+
+
+# ---------------------------------------------------------------------------
+# Trivially-movable operand helpers (phase 1 operand relocation)
+# ---------------------------------------------------------------------------
+_TRIVIAL_SINGLE_OPCODES = frozenset({
+    "bitcast", "convert", "transpose", "reshape", "broadcast",
+    "get-tuple-element", "tuple", "copy",
+})
+
+_TRIVIAL_FUSED_OPCODES = frozenset({
+    "parameter", "constant", "iota",
+    "convert", "bitcast", "reshape", "transpose", "broadcast", "copy",
+    "get-tuple-element", "tuple",
+    "add", "subtract", "multiply", "divide", "negate", "abs",
+    "maximum", "minimum", "and", "or", "not", "xor",
+    "sqrt", "rsqrt", "exp", "log", "sign", "clamp",
+    "floor", "ceil", "round-nearest-afz", "round-nearest-even",
+    "compare", "select",
+})
+
+
+def _is_trivial_fusion_body(inst) -> bool:
+    """True if every op inside inst's called computations is trivial (no heavy compute)."""
+    try:
+        for comp in inst.called_computations():
+            for fi in comp.instructions():
+                if fi.opcode not in _TRIVIAL_FUSED_OPCODES:
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+def _is_trivially_movable_inst(inst) -> bool:
+    """True if inst can be safely relocated in the schedule without heavy compute cost."""
+    opc = inst.opcode
+    if opc in _TRIVIAL_SINGLE_OPCODES:
+        return True
+    if opc == "fusion":
+        return _is_trivial_fusion_body(inst)
+    return False
+
+
+def _collect_movable_operands(
+    ag_start,
+    desired_pos: int,
+    ag_start_pos: int,
+    positions: dict,
+) -> Optional[list]:
+    """Collect instructions in [desired_pos, ag_start_pos) that must move with ag_start.
+
+    Transitively follows ag_start's operands to find every instruction in the
+    blocking window.  Returns them in topological (original schedule) order, or
+    None if any blocking instruction is not trivially movable or has a
+    non-movable dependency still inside the window.
+    """
+    movable: set = set()
+    queue = list(ag_start.operands())
+    while queue:
+        inst = queue.pop()
+        if inst not in positions:
+            continue
+        pos = positions[inst]
+        if pos < desired_pos or pos >= ag_start_pos:
+            continue
+        if inst in movable:
+            continue
+        if not _is_trivially_movable_inst(inst):
+            return None
+        movable.add(inst)
+        queue.extend(inst.operands())
+
+    # Reject if any movable item depends on a "stay" item still inside the window.
+    for inst in movable:
+        for op in inst.operands():
+            op_pos = positions.get(op)
+            if op_pos is None:
+                continue
+            if desired_pos <= op_pos < ag_start_pos and op not in movable:
+                return None
+
+    return sorted(movable, key=lambda i: positions[i])
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: schedule reordering
+# ---------------------------------------------------------------------------
+def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
+    """Move async collective starts earlier where latency is under-hidden.
+
+    Returns (changed, split_candidates) where split_candidates contains
+    collectives that still had a deficit and were fully dep-blocked.
+    """
+    changed = False
+    split_candidates: list[_SplitCandidate] = []
+
+    for comp in module.make_nonfusion_computations():
+        seq = list(schedule.sequence(comp))
+
+        start_of_done: dict = {}
+        for inst in seq:
+            if _is_async_done(inst):
+                ops = list(inst.operands())
+                if ops:
+                    start_of_done[inst] = ops[0]
+
+        if not start_of_done:
+            continue
+
+        _logger.debug(
+            "collective_overlap_pass [%s]: found %d async collective pairs.",
+            module_name, len(start_of_done),
+        )
+
+        positions = {inst: i for i, inst in enumerate(seq)}
+
+        for ag_done, ag_start in start_of_done.items():
+            try:
+                profile_key = ag_start.async_wrapped_root().name
+            except Exception:
+                profile_key = ag_start.name
+            collective_latency = _profile_costs.get(profile_key)
+            if collective_latency is None or collective_latency <= 0:
+                _logger.debug(
+                    "collective_overlap_pass [%s]: no profile entry for %s",
+                    module_name, ag_start.name,
+                )
+                continue
+
+            ag_start_pos = positions[ag_start]
+            ag_done_pos = positions[ag_done]
+
+            current_overlap = sum(
+                _profile_costs.get(seq[i].name, 0.0)
+                for i in range(ag_start_pos + 1, ag_done_pos)
+            )
+
+            if current_overlap >= collective_latency:
+                _logger.debug(
+                    "collective_overlap_pass [%s]: %s already hidden "
+                    "(overlap=%.1f us >= latency=%.1f us).",
+                    module_name, ag_start.name, current_overlap, collective_latency,
+                )
+                continue
+
+            deficit = collective_latency - current_overlap
+            _logger.debug(
+                "collective_overlap_pass [%s]: %s deficit=%.1f us "
+                "(latency=%.1f us, overlap=%.1f us).",
+                module_name, ag_start.name, deficit, collective_latency, current_overlap,
+            )
+
+            earliest_valid = (
+                max(
+                    (positions[op] for op in ag_start.operands() if op in positions),
+                    default=-1,
+                )
+                + 1
+            )
+
+            # Find the desired position ignoring operand constraints — scan all
+            # the way back so we can later decide whether operand relocation is needed.
+            accumulated = 0.0
+            desired_pos = ag_start_pos  # fallback: no improvement possible
+            for i in range(ag_start_pos - 1, -1, -1):
+                accumulated += _profile_costs.get(seq[i].name, 0.0)
+                if accumulated >= deficit:
+                    desired_pos = i
+                    break
+
+            if desired_pos >= ag_start_pos:
+                # Not enough total compute before this collective to hide its latency.
+                _logger.debug(
+                    "collective_overlap_pass [%s]: %s cannot hide deficit "
+                    "(insufficient total compute, deficit=%.1f us).",
+                    module_name, ag_start.name, deficit,
+                )
+                if deficit >= _SPLIT_DEFICIT_THRESHOLD_US:
+                    eff_positions = [
+                        _effective_producer_pos(op, positions)
+                        for op in ag_start.operands()
+                    ]
+                    split_candidates.append(_SplitCandidate(
+                        start_name=ag_start.name,
+                        done_name=ag_done.name,
+                        deficit_us=deficit,
+                        effective_producer_pos=eff_positions,
+                    ))
+                continue
+
+            if desired_pos >= earliest_valid:
+                # Direct move — no operand conflicts.
+                # Apply NIC startup slack: go one heavy kernel further back so
+                # the NIC can initiate before SM-saturating work begins.
+                for i in range(desired_pos - 1, earliest_valid - 1, -1):
+                    if _is_heavy_kernel_inst(seq[i]):
+                        desired_pos = i
+                        break
+                _logger.info(
+                    "collective_overlap_pass: moving %s from pos %d to %d "
+                    "(adds ~%.1f us of overlap, closes %.1f us deficit).",
+                    ag_start.name, ag_start_pos, desired_pos, accumulated, deficit,
+                )
+                new_seq = [inst for inst in seq if inst is not ag_start]
+                new_seq.insert(desired_pos, ag_start)
+                schedule.set_sequence(comp, new_seq)
+                seq = new_seq
+                positions = {inst: i for i, inst in enumerate(seq)}
+                changed = True
+            else:
+                # desired_pos < earliest_valid: operands sit between desired_pos
+                # and ag_start.  Try relocating them if they are all trivially
+                # movable (converts, transposes, elementwise fusions).
+                to_move = _collect_movable_operands(
+                    ag_start, desired_pos, ag_start_pos, positions
+                )
+                if to_move is None:
+                    _logger.debug(
+                        "collective_overlap_pass [%s]: %s cannot move "
+                        "(non-trivial operands in window, deficit=%.1f us).",
+                        module_name, ag_start.name, deficit,
+                    )
+                    if deficit >= _SPLIT_DEFICIT_THRESHOLD_US:
+                        eff_positions = [
+                            _effective_producer_pos(op, positions)
+                            for op in ag_start.operands()
+                        ]
+                        split_candidates.append(_SplitCandidate(
+                            start_name=ag_start.name,
+                            done_name=ag_done.name,
+                            deficit_us=deficit,
+                            effective_producer_pos=eff_positions,
+                        ))
+                    continue
+
+                _logger.info(
+                    "collective_overlap_pass: moving %s from pos %d to %d "
+                    "with %d relocated operands "
+                    "(adds ~%.1f us of overlap, closes %.1f us deficit).",
+                    ag_start.name, ag_start_pos, desired_pos,
+                    len(to_move), accumulated, deficit,
+                )
+                to_move_set = set(to_move) | {ag_start}
+                # All removed items are at positions >= desired_pos, so the
+                # insertion index in new_seq equals desired_pos.
+                new_seq = [inst for inst in seq if inst not in to_move_set]
+                ins_pos = desired_pos
+                for inst in to_move:  # already in topological (schedule) order
+                    new_seq.insert(ins_pos, inst)
+                    ins_pos += 1
+                new_seq.insert(ins_pos, ag_start)
+                schedule.set_sequence(comp, new_seq)
+                seq = new_seq
+                positions = {inst: i for i, inst in enumerate(seq)}
+                changed = True
+
+    return changed, split_candidates
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: split batched collectives at proto level
+# ---------------------------------------------------------------------------
+def _group_operands_by_epoch(
+    effective_positions: list[int],
+) -> list[list[int]]:
+    """Split operand indices into equal-rank groups ordered by effective position.
+
+    We sort operands by their effective producer position, then divide into
+    ceil(n / _SPLIT_GROUP_SIZE) equal-size buckets.  This rank-based approach
+    works even when the per-layer GEMMs are back-to-back with no position gap
+    (which is what LHS produces to maximise compute throughput).
+
+    Returns a list of ≥2 groups; returns [] if fewer than 2 groups would result.
+    """
+    n = len(effective_positions)
+    n_groups = max(_SPLIT_MIN_GROUPS, (n + _SPLIT_GROUP_SIZE - 1) // _SPLIT_GROUP_SIZE)
+    n_groups = min(n_groups, n // 2)  # guarantee ≥2 operands per group
+
+    indexed = sorted(enumerate(effective_positions), key=lambda x: x[1])
+
+    groups: list[list[int]] = []
+    base, remainder = divmod(n, n_groups)
+    start = 0
+    for g in range(n_groups):
+        size = base + (1 if g < remainder else 0)
+        groups.append([indexed[start + i][0] for i in range(size)])
+        start += size
+
+    return groups if len(groups) >= _SPLIT_MIN_GROUPS else []
+
+
+def _toposort_instructions(insts):
+    """Topological sort (Kahn's algorithm) over instruction proto list.
+
+    XLA's CreateFromProto requires each instruction's operands to appear before
+    it in the proto.instructions list.  When we add new instructions and reroute
+    operand IDs, the original ordering may be violated — this restores a valid
+    topological order.  Falls back to the original order on cycles.
+    """
+    from collections import deque as _deque
+
+    id_set = {i.id for i in insts}
+    id_to_inst = {i.id: i for i in insts}
+
+    in_degree: dict[int, int] = {i.id: 0 for i in insts}
+    users: dict[int, list] = {i.id: [] for i in insts}
+
+    for inst in insts:
+        deps = list(inst.operand_ids) + list(inst.control_predecessor_ids)
+        for op_id in deps:
+            if op_id in id_set:
+                in_degree[inst.id] += 1
+                users[op_id].append(inst.id)
+
+    queue = _deque(i.id for i in insts if in_degree[i.id] == 0)
+    result = []
+    while queue:
+        iid = queue.popleft()
+        result.append(id_to_inst[iid])
+        for uid in users[iid]:
+            in_degree[uid] -= 1
+            if in_degree[uid] == 0:
+                queue.append(uid)
+
+    return result if len(result) == len(insts) else insts
+
+
+def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> Optional[bytes]:
+    """Proto-level surgery: split each candidate into per-epoch sub-collectives.
+
+    This function imports hlo_pb2 directly and must run in a subprocess to avoid
+    protobuf descriptor pool conflicts with jaxlib's pre-registered protos.
+    """
+    if not candidates:
+        return None
+
+    _ensure_protos()
+    from xla.service import hlo_pb2  # type: ignore  # pylint: disable=import-outside-toplevel
+    from xla import xla_data_pb2  # type: ignore  # pylint: disable=import-outside-toplevel
+    _TUPLE = xla_data_pb2.TUPLE  # = 13
+
+    proto = hlo_pb2.HloModuleProto()
+    proto.ParseFromString(serialized_hlo)
+    sys.stderr.write(f"[split_core] parsed proto: {proto.name}, "
+                     f"{len(proto.computations)} computations\n")
+
+    id_to_comp = {c.id: c for c in proto.computations}
+
+    # Find the entry (main) computation: scheduled, non-fusion, most instructions.
+    entry_comp = None
+    for c in proto.computations:
+        if c.is_fusion_computation:
+            continue
+        if c.id not in proto.schedule.sequences:
+            continue
+        if entry_comp is None or (
+            len(proto.schedule.sequences[c.id].instruction_ids) >
+            len(proto.schedule.sequences[entry_comp.id].instruction_ids)
+        ):
+            entry_comp = c
+    if entry_comp is None:
+        sys.stderr.write("[split_core] no entry_comp found\n")
+        return None
+    sys.stderr.write(f"[split_core] entry_comp: {entry_comp.name} "
+                     f"({len(entry_comp.instructions)} insts)\n")
+
+    name_to_id = {inst.name: inst.id for inst in entry_comp.instructions}
+    id_to_inst = {inst.id: inst for inst in entry_comp.instructions}
+
+    sched_ids = list(proto.schedule.sequences[entry_comp.id].instruction_ids)
+    id_to_sched_pos = {iid: pos for pos, iid in enumerate(sched_ids)}
+
+    # ID allocators
+    #
+    # Instruction IDs are packed as (computation_unique_id << 32) | local_id.
+    # CalculateLocalId = id & 0xFFFFFFFF, used as key in each computation's
+    # instruction_map.  Allocating simply from global_max+1 picks a value whose
+    # lower 32 bits may equal an existing local_id in entry_comp → collision.
+    #
+    # Fix: for new instructions in entry_comp, use entry_comp's own parent bits
+    # and a local_id above the current max in entry_comp.  For new async
+    # computations, use their own comp id as the parent bits, starting at 0.
+    _MASK32 = 0xFFFFFFFF
+    _entry_parent_bits = entry_comp.id << 32
+    _max_entry_local = max(
+        (i.id & _MASK32 for i in entry_comp.instructions), default=-1
+    )
+    _next_entry_local = [_max_entry_local + 1]
+
+    def _new_iid():
+        """New instruction ID in entry_comp — same parent bits, fresh local id."""
+        v = _next_entry_local[0]; _next_entry_local[0] += 1
+        return _entry_parent_bits | (v & _MASK32)
+
+    _next_comp_id = [max((c.id for c in proto.computations), default=0) + 1]
+
+    def _new_cid():
+        v = _next_comp_id[0]; _next_comp_id[0] += 1; return v
+
+    # Instructions in NEW async computations get their own parent bits.
+    # _new_async_iid(comp_id, local_counter) returns a packed ID for that comp.
+    def _new_async_iid(comp_parent_bits: int, local_ctr: list) -> int:
+        v = local_ctr[0]; local_ctr[0] += 1
+        return comp_parent_bits | (v & _MASK32)
+
+    # Collect all used channel_ids to allocate fresh ones for sub-collectives.
+    _used_channels: set[int] = set()
+    for _c in proto.computations:
+        for _i in _c.instructions:
+            if _i.channel_id:
+                _used_channels.add(_i.channel_id)
+    _next_channel_id = [max(_used_channels, default=0) + 1]
+
+    def _new_channel():
+        v = _next_channel_id[0]; _next_channel_id[0] += 1; return v
+
+    any_split = False
+
+    for cand in candidates:
+        sys.stderr.write(f"[split_core] processing candidate: {cand.start_name} "
+                         f"(deficit={cand.deficit_us:.1f}us, "
+                         f"n_ep={len(cand.effective_producer_pos)} operands)\n")
+        start_id = name_to_id.get(cand.start_name)
+        if start_id is None:
+            sys.stderr.write(f"[split_core] start {cand.start_name!r} not in proto\n")
+            sys.stderr.write(f"[split_core] known names sample: "
+                             f"{list(name_to_id)[:5]}\n")
+            continue
+        start_inst = id_to_inst.get(start_id)
+        if start_inst is None:
+            sys.stderr.write(f"[split_core] start_id {start_id} not in id_to_inst\n")
+            continue
+
+        # Find the async-done (its only operand is start_inst)
+        done_inst = None
+        done_id_search = name_to_id.get(cand.done_name)
+        if done_id_search:
+            done_inst = id_to_inst.get(done_id_search)
+        if done_inst is None:
+            sys.stderr.write(f"[split_core] done {cand.done_name!r} not in proto\n")
+            continue
+
+        n_operands = len(start_inst.operand_ids)
+        sys.stderr.write(f"[split_core] {cand.start_name}: n_operands={n_operands}\n")
+        if n_operands < 2:
+            sys.stderr.write(f"[split_core] {cand.start_name}: too few operands, skip\n")
+            continue
+
+        if not start_inst.called_computation_ids:
+            sys.stderr.write(f"[split_core] {cand.start_name}: no called_computation_ids\n")
+            continue
+        called_comp = id_to_comp.get(start_inst.called_computation_ids[0])
+        if called_comp is None:
+            sys.stderr.write(f"[split_core] {cand.start_name}: called comp not found\n")
+            continue
+
+        # Find inner collective op and params in called computation
+        inner_inst = None
+        param_map: dict[int, object] = {}
+        for inst in called_comp.instructions:
+            if inst.opcode in ("reduce-scatter", "all-reduce", "all-gather",
+                               "collective-permute"):
+                inner_inst = inst
+            elif inst.opcode == "parameter":
+                param_map[inst.parameter_number] = inst
+        if inner_inst is None:
+            sys.stderr.write(
+                f"[split_core] no inner collective in {cand.start_name} called comp "
+                f"(opcodes: {[i.opcode for i in called_comp.instructions]})\n"
+            )
+            continue
+
+        # Group operands by effective producer epoch.
+        # Note: cand.effective_producer_pos comes from phase-1 C++ schedule
+        # positions which may differ from the proto schedule positions.  We
+        # use them only for grouping (relative order is preserved); the actual
+        # insertion positions are recomputed via _proto_effective_pos below.
+        groups = _group_operands_by_epoch(cand.effective_producer_pos)
+        _sorted_pos = sorted(cand.effective_producer_pos)
+        _gaps = [_sorted_pos[i+1] - _sorted_pos[i] for i in range(len(_sorted_pos)-1)]
+        _max_gap = max(_gaps) if _gaps else 0
+        sys.stderr.write(
+            f"[split_core] {cand.start_name}: ep_pos min={min(cand.effective_producer_pos)} "
+            f"max={max(cand.effective_producer_pos)} "
+            f"span={max(cand.effective_producer_pos)-min(cand.effective_producer_pos)}, "
+            f"max_consecutive_gap={_max_gap}, groups={len(groups)}\n"
+        )
+        sys.stderr.write(f"[split_core] sorted_ep_pos (phase1, may be stale): {_sorted_pos}\n")
+        # Log fresh proto positions for debugging.
+        # depth=8: traces to GEMM; depth=1: stops at direct dep (GTE for bitcasts).
+        _fresh_ep8 = [
+            _proto_effective_pos(start_inst.operand_ids[i], id_to_inst, id_to_sched_pos, max_depth=8)
+            for i in range(len(start_inst.operand_ids))
+        ]
+        _fresh_ep1 = [
+            _proto_effective_pos(start_inst.operand_ids[i], id_to_inst, id_to_sched_pos, max_depth=1)
+            for i in range(len(start_inst.operand_ids))
+        ]
+        sys.stderr.write(f"[split_core] sorted_ep_pos (proto, depth=8): {sorted(_fresh_ep8)}\n")
+        sys.stderr.write(f"[split_core] sorted_ep_pos (proto, depth=1): {sorted(_fresh_ep1)}\n")
+        if not groups:
+            sys.stderr.write(
+                f"[split_core] {cand.start_name}: could not form ≥2 groups "
+                f"(n={len(cand.effective_producer_pos)}, group_size={_SPLIT_GROUP_SIZE}), "
+                f"cannot split\n"
+            )
+            continue
+
+        epoch_summaries = [
+            f"g{i}:{len(g)}ops@pos{max(cand.effective_producer_pos[j] for j in g)}"
+            for i, g in enumerate(groups)
+        ]
+        _logger.info(
+            "collective_overlap_pass: splitting %s (deficit=%.1f us) "
+            "into %d groups: %s",
+            cand.start_name, cand.deficit_us, len(groups), epoch_summaries,
+        )
+
+        # --- For each group, build a sub-collective ---
+        # new_pairs: (group_indices, new_start_id, new_done_id,
+        # (group_indices, new_start_id, new_done_id, effective_insert_after_pos, group_op_ids)
+        new_pairs: list[tuple[list[int], int, int, int, list[int]]] = []
+        _seen_gte_ids: set[int] = set()  # guards against duplicate intermediate insertion
+        _ZERO_COST_OPS = frozenset(("bitcast", "get-tuple-element", "tuple"))
+
+        for g_idx, group in enumerate(groups):
+            effective_insert_after = max(
+                _proto_effective_pos(start_inst.operand_ids[i], id_to_inst, id_to_sched_pos)
+                for i in group
+            )
+            group_op_ids: list[int] = []
+            for i in group:
+                op_id = start_inst.operand_ids[i]
+                intermediates: list[int] = []
+                cur_id = op_id
+                while True:
+                    inst = id_to_inst.get(cur_id)
+                    if (inst is None or inst.opcode not in _ZERO_COST_OPS
+                            or not inst.operand_ids):
+                        break
+                    next_id = inst.operand_ids[0]
+                    next_inst = id_to_inst.get(next_id)
+                    if next_inst is None or next_inst.opcode not in _ZERO_COST_OPS:
+                        break
+                    if next_id not in _seen_gte_ids:
+                        intermediates.append(next_id)
+                        _seen_gte_ids.add(next_id)
+                    cur_id = next_id
+                group_op_ids.extend(reversed(intermediates))
+                group_op_ids.append(op_id)
+
+            # New async computation
+            new_cid = _new_cid()
+            nc = proto.computations.add()
+            nc.id = new_cid
+            nc.name = f"{called_comp.name}.g{g_idx}"
+            nc.is_fusion_computation = False
+            nc.execution_thread = called_comp.execution_thread
+
+            # Parameters — use the new computation's parent bits for its instructions
+            _nc_parent_bits = new_cid << 32
+            _nc_local_ctr = [0]
+            new_param_ids: list[int] = []
+            for new_idx, orig_idx in enumerate(group):
+                orig_p = param_map[orig_idx]
+                pid = _new_async_iid(_nc_parent_bits, _nc_local_ctr)
+                p = nc.instructions.add()
+                p.id = pid
+                p.name = f"param_{new_idx}.g{g_idx}"
+                p.opcode = "parameter"
+                p.parameter_number = new_idx
+                p.shape.CopyFrom(orig_p.shape)
+                new_param_ids.append(pid)
+
+            # Inner collective (same opcode / dims / replica_groups as original)
+            new_rs_id = _new_async_iid(_nc_parent_bits, _nc_local_ctr)
+            nr = nc.instructions.add()
+            nr.id = new_rs_id
+            nr.name = f"{inner_inst.name}.g{g_idx}"
+            nr.opcode = inner_inst.opcode
+            nr.operand_ids.extend(new_param_ids)
+            nr.dimensions.extend(inner_inst.dimensions)
+            nr.replica_groups.extend(inner_inst.replica_groups)
+            # Copy the to_apply reduction computation (e.g. add.47.clone)
+            nr.called_computation_ids.extend(inner_inst.called_computation_ids)
+            if inner_inst.channel_id:
+                nr.channel_id = _new_channel()  # must be unique per collective
+            nr.metadata.CopyFrom(inner_inst.metadata)
+            if inner_inst.backend_config:
+                nr.backend_config = inner_inst.backend_config
+            # Output shape: tuple of the subset of the original output tuple elements
+            nr.shape.element_type = _TUPLE
+            for orig_idx in group:
+                s = nr.shape.tuple_shapes.add()
+                s.CopyFrom(inner_inst.shape.tuple_shapes[orig_idx])
+            nc.root_id = new_rs_id
+
+            # Schedule sequence for the new async computation — XLA requires every
+            # non-fusion computation to have an entry in proto.schedule.sequences.
+            nc_seq = proto.schedule.sequences[new_cid]
+            for _p in nc.instructions:
+                nc_seq.instruction_ids.append(_p.id)
+
+            # async-start in main computation
+            ns_id = _new_iid()
+            ns = entry_comp.instructions.add()
+            ns.id = ns_id
+            ns.name = f"{cand.start_name}.g{g_idx}"
+            ns.opcode = "async-start"
+            ns.async_execution_thread = start_inst.async_execution_thread
+            ns.called_computation_ids.append(new_cid)
+            for orig_idx in group:
+                ns.operand_ids.append(start_inst.operand_ids[orig_idx])
+            ns.metadata.CopyFrom(start_inst.metadata)
+            if start_inst.backend_config:
+                ns.backend_config = start_inst.backend_config
+            if start_inst.frontend_attributes.map:
+                ns.frontend_attributes.CopyFrom(start_inst.frontend_attributes)
+            # Shape: (context_tuple, output_tuple) — both sub-tuples need TUPLE type
+            ns.shape.element_type = _TUPLE
+            ctx = ns.shape.tuple_shapes.add()
+            ctx.element_type = _TUPLE
+            for orig_idx in group:
+                s = ctx.tuple_shapes.add()
+                s.CopyFrom(start_inst.shape.tuple_shapes[0].tuple_shapes[orig_idx])
+            out = ns.shape.tuple_shapes.add()
+            out.element_type = _TUPLE
+            for orig_idx in group:
+                s = out.tuple_shapes.add()
+                s.CopyFrom(start_inst.shape.tuple_shapes[1].tuple_shapes[orig_idx])
+
+            # async-done in main computation
+            nd_id = _new_iid()
+            nd = entry_comp.instructions.add()
+            nd.id = nd_id
+            nd.name = f"{cand.done_name}.g{g_idx}"
+            nd.opcode = "async-done"
+            nd.operand_ids.append(ns_id)
+            nd.metadata.CopyFrom(done_inst.metadata)
+            if done_inst.backend_config:
+                nd.backend_config = done_inst.backend_config
+            if done_inst.frontend_attributes.map:
+                nd.frontend_attributes.CopyFrom(done_inst.frontend_attributes)
+            # Shape: output tuple (subset of original done output elements)
+            nd.shape.element_type = _TUPLE
+            for orig_idx in group:
+                s = nd.shape.tuple_shapes.add()
+                s.CopyFrom(start_inst.shape.tuple_shapes[1].tuple_shapes[orig_idx])
+
+            new_pairs.append((group, ns_id, nd_id, effective_insert_after, group_op_ids))
+
+        # --- Reroute GTE users of old done to appropriate split done ---
+        orig_to_new: dict[int, tuple[int, int]] = {}
+        for g_idx, (group, _, nd_id, _, _) in enumerate(new_pairs):
+            for new_idx, orig_idx in enumerate(group):
+                orig_to_new[orig_idx] = (nd_id, new_idx)
+
+        for inst in entry_comp.instructions:
+            if (inst.opcode == "get-tuple-element" and
+                    len(inst.operand_ids) == 1 and
+                    inst.operand_ids[0] == done_inst.id):
+                orig_idx = inst.tuple_index
+                if orig_idx in orig_to_new:
+                    new_nd_id, new_idx = orig_to_new[orig_idx]
+                    inst.operand_ids[0] = new_nd_id
+                    inst.tuple_index = new_idx
+
+        old_done_sched_pos = id_to_sched_pos.get(done_inst.id, len(sched_ids))
+
+        sys.stderr.write(f"[split_core] SCHED_POS {cand.start_name}: "
+                         f"{id_to_sched_pos.get(start_inst.id, -1)}\n")
+        sys.stderr.write(f"[split_core] SCHED_POS {cand.done_name}: "
+                         f"{old_done_sched_pos}\n")
+
+        # All direct operand IDs being repositioned (zero-cost bitcasts/GTEs).
+        _all_group_op_ids: set[int] = set()
+        for (_, _, _, _, op_ids) in new_pairs:
+            _all_group_op_ids.update(op_ids)
+
+        for (grp, ns_id, nd_id, eff_pos, op_ids) in new_pairs:
+            sys.stderr.write(f"[split_core] GROUP eff_pos={eff_pos}: "
+                             f"op_ids sched_pos={sorted(id_to_sched_pos.get(oid, -1) for oid in op_ids)}\n")
+
+        _remove_from_sched = {start_inst.id, done_inst.id} | _all_group_op_ids
+        new_sched = [iid for iid in sched_ids if iid not in _remove_from_sched]
+
+        # Map original positions → compact positions (after all removals).
+        orig_to_compact: dict[int, int] = {}
+        _cidx = 0
+        for _oi, _iid in enumerate(sched_ids):
+            if _iid not in _remove_from_sched:
+                orig_to_compact[_oi] = _cidx
+                _cidx += 1
+
+        # Insert each group's bitcasts + sub-start right after its GEMM.
+        sorted_pairs = sorted(new_pairs, key=lambda x: x[3])
+
+        for group, ns_id, nd_id, eff_pos, op_ids in sorted_pairs:
+            _cpct = orig_to_compact.get(eff_pos, eff_pos)
+            sys.stderr.write(f"[split_core] GROUP eff_pos={eff_pos} -> compact={_cpct}\n")
+        offset = 0
+        for group, ns_id, nd_id, eff_pos, op_ids in sorted_pairs:
+            compact_pos = orig_to_compact.get(eff_pos, eff_pos)
+            ins_pos = compact_pos + 1 + offset
+            # Reinsert the zero-cost operands first, then the sub-start.
+            for _op_id in op_ids:
+                new_sched.insert(ins_pos, _op_id)
+                ins_pos += 1
+                offset += 1
+            new_sched.insert(ins_pos, ns_id)
+            offset += 1
+
+        # Insert sub-dones just before the first surviving instruction after
+        # where the original done was.
+        compact_done_pos = len(new_sched)
+        for _i in range(old_done_sched_pos + 1, len(sched_ids)):
+            if _i in orig_to_compact:
+                compact_done_pos = orig_to_compact[_i]
+                break
+        done_insert_base = compact_done_pos + offset
+        for g_idx, (_, _, nd_id, _, _) in enumerate(sorted_pairs):
+            new_sched.insert(done_insert_base + g_idx, nd_id)
+
+        del proto.schedule.sequences[entry_comp.id].instruction_ids[:]
+        proto.schedule.sequences[entry_comp.id].instruction_ids.extend(new_sched)
+        sched_ids = new_sched
+        id_to_sched_pos = {iid: pos for pos, iid in enumerate(sched_ids)}
+
+        _remove_ids = {start_inst.id, done_inst.id}
+        _surviving = [i for i in entry_comp.instructions if i.id not in _remove_ids]
+        _ordered = _toposort_instructions(_surviving)
+        del entry_comp.instructions[:]
+        for _inst in _ordered:
+            entry_comp.instructions.add().CopyFrom(_inst)
+
+        # Rebuild lookup maps for subsequent candidates
+        id_to_inst = {inst.id: inst for inst in entry_comp.instructions}
+        name_to_id = {inst.name: inst.id for inst in entry_comp.instructions}
+
+        any_split = True
+        _logger.info(
+            "collective_overlap_pass: split %s into %d sub-collectives (%s)",
+            cand.start_name, len(groups), epoch_summaries,
+        )
+
+    if not any_split:
+        return None
+
+    # XLA's CreateFromProto processes computations in proto order and builds the
+    # computation_map incrementally.  Callee computations must appear BEFORE their
+    # callers, otherwise async-start instructions that reference a new async
+    # computation will fail with "invalid computation id" errors.
+    # Sort: entry_comp last; everything else (including new async sub-computations)
+    # before it.
+    _entry_id = entry_comp.id
+    _reordered = [c for c in proto.computations if c.id != _entry_id]
+    _entry_protos = [c for c in proto.computations if c.id == _entry_id]
+    _reordered.extend(_entry_protos)
+    del proto.computations[:]
+    for _c in _reordered:
+        proto.computations.add().CopyFrom(_c)
+    sys.stderr.write(
+        f"[split_core] reordered computations: {len(_reordered)} total, "
+        f"entry_comp last (id={_entry_id})\n"
+    )
+
+    return proto.SerializeToString()
+
+
+def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> Optional[bytes]:
+    """Spawn a subprocess to run _phase2_split_core.
+
+    The subprocess avoids protobuf descriptor pool conflicts that arise when
+    jaxlib pre-registers xla/service/metrics.proto in the host process.
+    """
+    if not candidates:
+        return None
+
+    import json as _json
+    import tempfile as _tempfile
+
+    with _tempfile.NamedTemporaryFile(delete=False, suffix=".hlo.bin") as _tf:
+        _tf.write(serialized_hlo)
+        _hlo_file = _tf.name
+
+    try:
+        _candidates_json = _json.dumps([{
+            "start_name": c.start_name,
+            "done_name": c.done_name,
+            "deficit_us": c.deficit_us,
+            "effective_producer_pos": c.effective_producer_pos,
+        } for c in candidates])
+
+        result = subprocess.run(
+            [sys.executable, __file__, "--split", _hlo_file, _candidates_json],
+            capture_output=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            _logger.warning(
+                "collective_overlap_pass: split subprocess failed (rc=%d):\n%s",
+                result.returncode,
+                result.stderr.decode("utf-8", errors="replace")[-3000:],
+            )
+            return None
+
+        # Always log subprocess stderr for diagnostics.
+        _sub_stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        if _sub_stderr:
+            _logger.info(
+                "collective_overlap_pass: split subprocess stderr:\n%s", _sub_stderr
+            )
+
+        if result.stdout:
+            _logger.info(
+                "collective_overlap_pass: split subprocess succeeded (%d bytes).",
+                len(result.stdout),
+            )
+            return result.stdout
+
+        _logger.info("collective_overlap_pass: split subprocess produced no output.")
+        return None
+
+    finally:
+        try:
+            os.unlink(_hlo_file)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Top-level POST_SCHEDULER pass entry point
+# ---------------------------------------------------------------------------
+def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
+    """Phase 1: reorder; Phase 2: split batched collectives."""
+    if not _profile_costs:
+        return None
+
+    from jax._src.lib import hlo as _hlo  # pylint: disable=import-outside-toplevel
+    module = _hlo.HloModule.from_serialized_hlo_module_proto(serialized_hlo)
+    schedule = module.schedule()
+    if schedule is None:
+        return None
+
+    module_name = module.name
+
+    # ---- Phase 1 ----
+    changed, split_candidates = _phase1_reorder(module, schedule, module_name)
+
+    if changed:
+        schedule.update()
+        schedule.verify()
+        module.set_schedule(schedule)
+        phase1_bytes = module.as_serialized_hlo_module_proto()
+    else:
+        phase1_bytes = serialized_hlo
+
+    # ---- Phase 2 ----
+    if split_candidates:
+        _logger.info(
+            "collective_overlap_pass [%s]: %d split candidate(s) after phase 1.",
+            module_name, len(split_candidates),
+        )
+        phase2_bytes = _phase2_split(phase1_bytes, split_candidates)
+        if phase2_bytes is not None:
+            return phase2_bytes
+
+    return phase1_bytes if changed else None
+
+
+# ---------------------------------------------------------------------------
+# PGLE profile interception
+# ---------------------------------------------------------------------------
+_patched = False
+
+
+def _patch_pgle_profiler() -> None:
+    global _patched
+    if _patched:
+        return
+    _patched = True
+    import jax._src.profiler as _jax_profiler  # pylint: disable=import-outside-toplevel
+    _original_consume = _jax_profiler.PGLEProfiler.consume_fdo_profile
+
+    def _consume_and_capture(self):
+        result = _original_consume(self)
+        if result:
+            _update_profile(result)
+        return result
+
+    _jax_profiler.PGLEProfiler.consume_fdo_profile = _consume_and_capture
+    _logger.debug("collective_overlap_pass: patched PGLEProfiler.consume_fdo_profile")
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def register() -> None:
+    """Register the collective-overlap POST_SCHEDULER pass and PGLE hook."""
+    import jax.extend.xla as jex_xla  # pylint: disable=import-outside-toplevel
+    _patch_pgle_profiler()
+    jex_xla.register_hlo_module_transformation(
+        _collective_overlap_pass,
+        name="profile_guided_collective_overlap",
+        stage=jex_xla.PipelineStage.POST_SCHEDULER,
+    )
+    _logger.info(
+        "collective_overlap_pass: registered POST_SCHEDULER pass "
+        "'profile_guided_collective_overlap'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess entry point for Phase 2 (avoids descriptor pool conflicts)
+# Usage: python collective_overlap_pass.py --split <hlo_file> <candidates_json>
+# Writes modified HLO bytes to stdout; exits 0 on success, non-zero on error.
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json as _json
+
+    if len(sys.argv) >= 4 and sys.argv[1] == "--split":
+        _hlo_file = sys.argv[2]
+        _candidates_data = _json.loads(sys.argv[3])
+
+        with open(_hlo_file, "rb") as _f:
+            _serialized = _f.read()
+
+        _candidates = [_SplitCandidate(**d) for d in _candidates_data]
+
+        try:
+            _result = _phase2_split_core(_serialized, _candidates)
+        except Exception as _exc:
+            import traceback as _tb
+            sys.stderr.write(f"collective_overlap_pass split error: {_exc}\n")
+            sys.stderr.write(_tb.format_exc())
+            sys.exit(1)
+
+        if _result:
+            sys.stdout.buffer.write(_result)
+        sys.exit(0)
+
+    sys.stderr.write(f"Usage: {sys.argv[0]} --split <hlo_file> <candidates_json>\n")
+    sys.exit(2)
