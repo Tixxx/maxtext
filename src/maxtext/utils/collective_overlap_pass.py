@@ -150,6 +150,7 @@ class _SplitCandidate:
     start_name: str
     done_name: str
     deficit_us: float
+    comp_name: str = ""
     # effective_producer_pos[i] = schedule position of the 'real' producer
     # (tracing through bitcasts/GTEs) for operand i of the async-start.
     effective_producer_pos: list[int] = field(default_factory=list)
@@ -364,6 +365,57 @@ def _collect_movable_operands(
 # ---------------------------------------------------------------------------
 # Phase 1: schedule reordering
 # ---------------------------------------------------------------------------
+def _innermost_first_computations(module, schedule) -> list:
+    """Return non-fusion scheduled computations in innermost-first DFS order.
+
+    While-body computations are visited before the computation that contains
+    their while instruction, so that inner schedule changes are committed
+    before outer schedules are processed.  Nested while loops are handled
+    by recursing depth-first.  The entry computation is always last.
+    """
+    all_comps = [
+        c for c in module.make_nonfusion_computations()
+        if schedule.sequence(c) is not None
+    ]
+
+    # Build a map of computation → set of while-body children.
+    # Simultaneously collect the set of all while-body callees so we can
+    # identify the root (entry) computation as the one with no callers.
+    children: dict = {c: [] for c in all_comps}
+    all_callees: set = set()
+    for comp in all_comps:
+        for inst in schedule.sequence(comp):
+            if inst.opcode == "while":
+                for called in inst.called_computations():
+                    if schedule.sequence(called) is not None:
+                        children[comp].append(called)
+                        all_callees.add(called)
+
+    # The entry computation is the only one not called as a while body.
+    roots = [c for c in all_comps if c not in all_callees]
+    if not roots:
+        # Fallback: return in original order (no while loop structure found).
+        return all_comps
+
+    def _collect(comp, visited: set, result: list) -> None:
+        if comp in visited:
+            return
+        visited.add(comp)
+        for child in children.get(comp, []):
+            _collect(child, visited, result)
+        result.append(comp)
+
+    visited: set = set()
+    result: list = []
+    for root in roots:
+        _collect(root, visited, result)
+    # Any computations not reachable from a root (e.g. orphaned while bodies).
+    for comp in all_comps:
+        if comp not in visited:
+            result.append(comp)
+    return result
+
+
 def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
     """Move async collective starts earlier where latency is under-hidden.
 
@@ -373,7 +425,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
     changed = False
     split_candidates: list[_SplitCandidate] = []
 
-    for comp in module.make_nonfusion_computations():
+    for comp in _innermost_first_computations(module, schedule):
         seq = list(schedule.sequence(comp))
 
         start_of_done: dict = {}
@@ -463,6 +515,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                         start_name=ag_start.name,
                         done_name=ag_done.name,
                         deficit_us=deficit,
+                        comp_name=comp.name,
                         effective_producer_pos=eff_positions,
                     ))
                 continue
@@ -508,6 +561,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                             start_name=ag_start.name,
                             done_name=ag_done.name,
                             deficit_us=deficit,
+                            comp_name=comp.name,
                             effective_producer_pos=eff_positions,
                         ))
                     continue
@@ -624,23 +678,43 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
                      f"{len(proto.computations)} computations\n")
 
     id_to_comp = {c.id: c for c in proto.computations}
+    name_to_comp = {c.name: c for c in proto.computations}
 
-    # Find the entry (main) computation: scheduled, non-fusion, most instructions.
-    entry_comp = None
+    # Find the module-level entry computation (largest scheduled non-fusion).
+    module_entry_comp = None
     for c in proto.computations:
         if c.is_fusion_computation:
             continue
         if c.id not in proto.schedule.sequences:
             continue
-        if entry_comp is None or (
+        if module_entry_comp is None or (
             len(proto.schedule.sequences[c.id].instruction_ids) >
-            len(proto.schedule.sequences[entry_comp.id].instruction_ids)
+            len(proto.schedule.sequences[module_entry_comp.id].instruction_ids)
         ):
-            entry_comp = c
-    if entry_comp is None:
-        sys.stderr.write("[split_core] no entry_comp found\n")
+            module_entry_comp = c
+    if module_entry_comp is None:
+        sys.stderr.write("[split_core] no module entry comp found\n")
         return None
-    sys.stderr.write(f"[split_core] entry_comp: {entry_comp.name} "
+
+    # Determine which computation to operate on for each candidate.
+    # Candidates from while-body computations carry comp_name; fall back to
+    # the module entry computation for legacy candidates without comp_name.
+    def _target_comp_for(cand):
+        if cand.comp_name:
+            c = name_to_comp.get(cand.comp_name)
+            if c is None:
+                sys.stderr.write(
+                    f"[split_core] comp_name '{cand.comp_name}' not found, "
+                    f"falling back to module entry\n"
+                )
+                return module_entry_comp
+            return c
+        return module_entry_comp
+
+    # All candidates must target the same computation per split_core invocation
+    # (each subprocess call handles one batch of candidates from one computation).
+    entry_comp = _target_comp_for(candidates[0])
+    sys.stderr.write(f"[split_core] target comp: {entry_comp.name} "
                      f"({len(entry_comp.instructions)} insts)\n")
 
     name_to_id = {inst.name: inst.id for inst in entry_comp.instructions}
@@ -1027,20 +1101,18 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
 
     # XLA's CreateFromProto processes computations in proto order and builds the
     # computation_map incrementally.  Callee computations must appear BEFORE their
-    # callers, otherwise async-start instructions that reference a new async
-    # computation will fail with "invalid computation id" errors.
-    # Sort: entry_comp last; everything else (including new async sub-computations)
-    # before it.
-    _entry_id = entry_comp.id
-    _reordered = [c for c in proto.computations if c.id != _entry_id]
-    _entry_protos = [c for c in proto.computations if c.id == _entry_id]
+    # callers.  The module entry computation must be last since it calls everything
+    # else (including new async sub-computations added by phase 2).
+    _module_entry_id = module_entry_comp.id
+    _reordered = [c for c in proto.computations if c.id != _module_entry_id]
+    _entry_protos = [c for c in proto.computations if c.id == _module_entry_id]
     _reordered.extend(_entry_protos)
     del proto.computations[:]
     for _c in _reordered:
         proto.computations.add().CopyFrom(_c)
     sys.stderr.write(
         f"[split_core] reordered computations: {len(_reordered)} total, "
-        f"entry_comp last (id={_entry_id})\n"
+        f"module entry last (id={_module_entry_id})\n"
     )
 
     return proto.SerializeToString()
@@ -1067,6 +1139,7 @@ def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> O
             "start_name": c.start_name,
             "done_name": c.done_name,
             "deficit_us": c.deficit_us,
+            "comp_name": c.comp_name,
             "effective_producer_pos": c.effective_producer_pos,
         } for c in candidates])
 
@@ -1177,6 +1250,9 @@ def _patch_pgle_profiler() -> None:
 # ---------------------------------------------------------------------------
 def register() -> None:
     """Register the collective-overlap POST_SCHEDULER pass and PGLE hook."""
+    if os.environ.get("COLLECTIVE_OVERLAP_DISABLE", "0") == "1":
+        _logger.info("collective_overlap_pass: disabled via COLLECTIVE_OVERLAP_DISABLE=1")
+        return
     import jax.extend.xla as jex_xla  # pylint: disable=import-outside-toplevel
     _patch_pgle_profiler()
     jex_xla.register_hlo_module_transformation(
