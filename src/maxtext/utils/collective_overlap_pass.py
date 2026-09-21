@@ -926,7 +926,17 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
                         _seen_gte_ids.add(next_id)
                     cur_id = next_id
                 group_op_ids.extend(reversed(intermediates))
-                group_op_ids.append(op_id)
+                # op_id itself must go through the same dedup: two different
+                # operand indices in this (or another) group can reference the
+                # exact same instruction (e.g. a combined all-gather whose
+                # operand tuple repeats a buffer), or one operand's own op_id
+                # can turn out to be an ancestor discovered while walking a
+                # later operand's chain. Either way it must only be relocated
+                # once — inserting the same instruction into the schedule
+                # twice trips XLA's schedule verifier (hlo_schedule.cc:439).
+                if op_id not in _seen_gte_ids:
+                    group_op_ids.append(op_id)
+                    _seen_gte_ids.add(op_id)
 
             # New async computation
             new_cid = _new_cid()
