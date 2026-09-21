@@ -945,7 +945,7 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
                 pid = _new_async_iid(_nc_parent_bits, _nc_local_ctr)
                 p = nc.instructions.add()
                 p.id = pid
-                p.name = f"param_{new_idx}.g{g_idx}"
+                p.name = f"param_{new_idx}.{nc.name}"
                 p.opcode = "parameter"
                 p.parameter_number = new_idx
                 p.shape.CopyFrom(orig_p.shape)
