@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -160,6 +161,18 @@ def _is_async_done(inst: object) -> bool:
     return any(inst.name.startswith(p) for p in _ASYNC_DONE_PREFIXES)
 
 
+def _opcode_str(inst) -> str:
+    """Canonical hyphenated opcode string (e.g. "get-tuple-element") for a
+    phase-1 C++ HloInstruction.
+
+    inst.opcode returns a jaxlib._hlo.HloOpcode enum (e.g. HloOpcode.kFusion),
+    not a plain string, so comparing it directly against string literals or
+    string sets is always False.  This converts the enum's CamelCase member
+    name (minus the leading 'k') to XLA's kebab-case opcode spelling.
+    """
+    return re.sub(r"(?<!^)(?=[A-Z])", "-", inst.opcode.name[1:]).lower()
+
+
 _HEAVY_INPUT_BYTES = 8 * 1024 * 1024  # 8 MB threshold for fusion inputs
 
 # XLA PrimitiveType → bytes per element (xla_data.proto enum values)
@@ -202,45 +215,13 @@ def _is_heavy_kernel_proto(inst, id_to_inst: dict) -> bool:
     return False
 
 
-def _is_heavy_kernel_inst(inst) -> bool:
-    """Phase-1 variant of _is_heavy_kernel_proto for C++ XLA instruction objects."""
-    opc = inst.opcode
-    if opc == "custom-call":
-        try:
-            tgt = inst.custom_call_target().lower()
-            return "cublas" in tgt or "cudnn" in tgt
-        except Exception:
-            pass
-    if opc == "fusion":
-        try:
-            total = sum(_shape_size_bytes(op.shape) for op in inst.operands())
-            return total >= _HEAVY_INPUT_BYTES
-        except Exception:
-            pass
-    return False
-
-
-def _shape_size_bytes(shape) -> int:
-    """Total bytes for an XLA Shape object (phase-1 C++ wrapper)."""
-    try:
-        if shape.is_tuple():
-            return sum(_shape_size_bytes(s) for s in shape.tuple_shapes())
-        n = 1
-        for d in shape.dimensions():
-            n *= d
-        return n * _PTYPE_BYTES.get(int(shape.element_type()), 4)
-    except Exception:
-        return 0
-
-
 def _effective_producer_pos(inst, positions: dict, max_depth: int = 8) -> int:
     """Return the schedule position of inst's 'real' producer, looking through
     zero-cost ops (bitcast, get-tuple-element, tuple) up to max_depth steps."""
     _ZERO_COST = ("bitcast", "get-tuple-element", "tuple")
     cur = inst
     for _ in range(max_depth):
-        opc = cur.opcode
-        if opc not in _ZERO_COST:
+        if _opcode_str(cur) not in _ZERO_COST:
             break
         ops = list(cur.operands())
         if not ops or ops[0] not in positions:
@@ -290,6 +271,7 @@ _TRIVIAL_SINGLE_OPCODES = frozenset({
 _TRIVIAL_FUSED_OPCODES = frozenset({
     "parameter", "constant", "iota",
     "convert", "bitcast", "reshape", "transpose", "broadcast", "copy",
+    "concatenate", "dynamic-slice",
     "get-tuple-element", "tuple",
     "add", "subtract", "multiply", "divide", "negate", "abs",
     "maximum", "minimum", "and", "or", "not", "xor",
@@ -299,72 +281,127 @@ _TRIVIAL_FUSED_OPCODES = frozenset({
 })
 
 
-def _is_trivial_fusion_body(inst) -> bool:
-    """True if every op inside inst's called computations is trivial (no heavy compute)."""
+_CALLS_RE = re.compile(r"calls=%([A-Za-z0-9_.]+)")
+
+
+def _is_trivial_fusion_body(inst, comp_by_name: dict) -> bool:
+    """True if every op inside inst's called (fused) computation is trivial.
+
+    The phase-1 HloInstruction binding (jax._src.lib.hlo) has no
+    called_computations()/instructions() accessor, so the callee computation
+    name is recovered from inst.to_string() (which always prints
+    "calls=%name" for a fusion) and looked up in a module-wide name->comp map.
+    """
     try:
-        for comp in inst.called_computations():
-            for fi in comp.instructions():
-                if fi.opcode not in _TRIVIAL_FUSED_OPCODES:
-                    return False
+        text = inst.to_string()
+    except Exception:
+        return False
+    m = _CALLS_RE.search(text)
+    if not m:
+        return False
+    comp = comp_by_name.get(m.group(1))
+    if comp is None:
+        return False
+    try:
+        for fi in comp.instructions():
+            if _opcode_str(fi) not in _TRIVIAL_FUSED_OPCODES:
+                return False
         return True
     except Exception:
         return False
 
 
-def _is_trivially_movable_inst(inst) -> bool:
+def _is_trivially_movable_inst(inst, comp_by_name: dict) -> bool:
     """True if inst can be safely relocated in the schedule without heavy compute cost."""
-    opc = inst.opcode
+    opc = _opcode_str(inst)
     if opc in _TRIVIAL_SINGLE_OPCODES:
         return True
     if opc == "fusion":
-        return _is_trivial_fusion_body(inst)
+        return _is_trivial_fusion_body(inst, comp_by_name)
     return False
 
 
-def _collect_movable_operands(
-    ag_start,
-    desired_pos: int,
-    ag_start_pos: int,
-    positions: dict,
-) -> Optional[list]:
-    """Collect instructions in [desired_pos, ag_start_pos) that must move with ag_start.
+_CONTROL_PRED_RE = re.compile(r"control-predecessors=\{([^}]*)\}")
 
-    Transitively follows ag_start's operands to find every instruction in the
-    blocking window.  Returns them in topological (original schedule) order, or
-    None if any blocking instruction is not trivially movable or has a
-    non-movable dependency still inside the window.
+
+def _control_predecessor_names(inst) -> list[str]:
+    """Names of inst's control-predecessors.
+
+    The jaxlib HloInstruction Python binding used in phase 1 (jax._src.lib.hlo)
+    does not expose control_predecessors() directly, so we recover them from
+    the instruction's textual form, which always prints them when present.
+    """
+    try:
+        text = inst.to_string()
+    except Exception:
+        return []
+    m = _CONTROL_PRED_RE.search(text)
+    if not m:
+        return []
+    return [n.strip().lstrip("%") for n in m.group(1).split(",") if n.strip()]
+
+
+_MAX_RELOCATE_CHAIN = 64
+
+
+def _earliest_legal_pos(
+    ag_start,
+    positions: dict,
+    name_to_pos: dict,
+    comp_by_name: dict,
+) -> tuple[int, list]:
+    """Compute the earliest position ag_start can legally be relocated to.
+
+    Walks ag_start's operands transitively through trivially-movable
+    instructions (bitcast/reshape/elementwise ops, trivial fusions, etc.) —
+    unlike a fixed relocation window, this walk has no distance bound, since
+    a trivial/zero-cost op is free to move arbitrarily far back.  The walk
+    stops at any non-trivial ("real compute") instruction, which pins a data-
+    dependency floor: the move can be no earlier than right after it.  Every
+    control-predecessor of a moved instruction (or of ag_start itself) that
+    is not itself part of the moving set pins a control-dependency floor the
+    same way.
+
+    Returns (floor, movable) where floor is the smallest legal insertion
+    position (in the current, pre-move schedule) and movable is the trivial
+    chain to relocate alongside ag_start (sorted in schedule order, excluding
+    ag_start itself).
     """
     movable: set = set()
+    seen: set = set()
+    floor = 0
     queue = list(ag_start.operands())
     while queue:
         inst = queue.pop()
+        if inst in seen:
+            continue
+        seen.add(inst)
         if inst not in positions:
             continue
-        pos = positions[inst]
-        if pos < desired_pos or pos >= ag_start_pos:
-            continue
-        if inst in movable:
-            continue
-        if not _is_trivially_movable_inst(inst):
-            return None
-        movable.add(inst)
-        queue.extend(inst.operands())
+        if len(movable) < _MAX_RELOCATE_CHAIN and _is_trivially_movable_inst(inst, comp_by_name):
+            movable.add(inst)
+            queue.extend(inst.operands())
+        else:
+            floor = max(floor, positions[inst] + 1)
 
-    # Reject if any movable item depends on a "stay" item still inside the window.
-    for inst in movable:
-        for op in inst.operands():
-            op_pos = positions.get(op)
-            if op_pos is None:
+    moving_names = {inst.name for inst in movable} | {ag_start.name}
+    for inst in list(movable) + [ag_start]:
+        for name in _control_predecessor_names(inst):
+            if name in moving_names:
                 continue
-            if desired_pos <= op_pos < ag_start_pos and op not in movable:
-                return None
+            cp_pos = name_to_pos.get(name)
+            if cp_pos is not None:
+                floor = max(floor, cp_pos + 1)
 
-    return sorted(movable, key=lambda i: positions[i])
+    return floor, sorted(movable, key=lambda i: positions[i])
 
 
 # ---------------------------------------------------------------------------
 # Phase 1: schedule reordering
 # ---------------------------------------------------------------------------
+_WHILE_CALLS_RE = re.compile(r"(?:condition|body)=%([A-Za-z0-9_.]+)")
+
+
 def _innermost_first_computations(module, schedule) -> list:
     """Return non-fusion scheduled computations in innermost-first DFS order.
 
@@ -377,19 +414,35 @@ def _innermost_first_computations(module, schedule) -> list:
         c for c in module.make_nonfusion_computations()
         if schedule.sequence(c) is not None
     ]
+    # Local name->comp map restricted to this same accessor call, so lookups
+    # stay identity-consistent with all_comps (HloComputation has no custom
+    # __eq__/__hash__, so objects from a different accessor call may not
+    # compare equal even for the same underlying computation).
+    local_comp_by_name = {c.name: c for c in all_comps}
 
     # Build a map of computation → set of while-body children.
     # Simultaneously collect the set of all while-body callees so we can
     # identify the root (entry) computation as the one with no callers.
+    #
+    # inst.opcode is a jaxlib._hlo.HloOpcode enum (not a string) and
+    # HloInstruction has no called_computations() accessor, so both the
+    # opcode check and the callee lookup go through _opcode_str()/to_string()
+    # parsing instead of direct attribute access.
     children: dict = {c: [] for c in all_comps}
     all_callees: set = set()
     for comp in all_comps:
         for inst in schedule.sequence(comp):
-            if inst.opcode == "while":
-                for called in inst.called_computations():
-                    if schedule.sequence(called) is not None:
-                        children[comp].append(called)
-                        all_callees.add(called)
+            if _opcode_str(inst) != "while":
+                continue
+            try:
+                text = inst.to_string()
+            except Exception:
+                continue
+            for name in _WHILE_CALLS_RE.findall(text):
+                called = local_comp_by_name.get(name)
+                if called is not None and schedule.sequence(called) is not None:
+                    children[comp].append(called)
+                    all_callees.add(called)
 
     # The entry computation is the only one not called as a while body.
     roots = [c for c in all_comps if c not in all_callees]
@@ -424,6 +477,10 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
     """
     changed = False
     split_candidates: list[_SplitCandidate] = []
+    # Module-wide name->computation map (includes fusion sub-computations,
+    # unlike make_nonfusion_computations()), used to inspect a fusion's body
+    # for triviality — see _is_trivial_fusion_body.
+    comp_by_name = {c.name: c for c in module.computations()}
 
     for comp in _innermost_first_computations(module, schedule):
         seq = list(schedule.sequence(comp))
@@ -444,6 +501,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
         )
 
         positions = {inst: i for i, inst in enumerate(seq)}
+        name_to_pos = {inst.name: i for inst, i in positions.items()}
 
         for ag_done, ag_start in start_of_done.items():
             try:
@@ -481,29 +539,19 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                 module_name, ag_start.name, deficit, collective_latency, current_overlap,
             )
 
-            earliest_valid = (
-                max(
-                    (positions[op] for op in ag_start.operands() if op in positions),
-                    default=-1,
-                )
-                + 1
-            )
+            # Find the earliest legally reachable position for ag_start (plus
+            # any trivial/zero-cost operand chain that must move with it).
+            # We always move all the way to this floor rather than just far
+            # enough to close the deficit: any earlier position only adds
+            # overlap headroom, and going as early as legally allowed also
+            # puts the collective in front of any heavy compute (e.g. GEMMs)
+            # that isn't an actual data/control dependency of its own.
+            floor, to_move = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
 
-            # Find the desired position ignoring operand constraints — scan all
-            # the way back so we can later decide whether operand relocation is needed.
-            accumulated = 0.0
-            desired_pos = ag_start_pos  # fallback: no improvement possible
-            for i in range(ag_start_pos - 1, -1, -1):
-                accumulated += _profile_costs.get(seq[i].name, 0.0)
-                if accumulated >= deficit:
-                    desired_pos = i
-                    break
-
-            if desired_pos >= ag_start_pos:
-                # Not enough total compute before this collective to hide its latency.
+            if floor >= ag_start_pos:
                 _logger.debug(
-                    "collective_overlap_pass [%s]: %s cannot hide deficit "
-                    "(insufficient total compute, deficit=%.1f us).",
+                    "collective_overlap_pass [%s]: %s cannot move "
+                    "(no legal earlier position, deficit=%.1f us).",
                     module_name, ag_start.name, deficit,
                 )
                 if deficit >= _SPLIT_DEFICIT_THRESHOLD_US:
@@ -520,72 +568,50 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                     ))
                 continue
 
-            if desired_pos >= earliest_valid:
-                # Direct move — no operand conflicts.
-                # Apply NIC startup slack: go one heavy kernel further back so
-                # the NIC can initiate before SM-saturating work begins.
-                for i in range(desired_pos - 1, earliest_valid - 1, -1):
-                    if _is_heavy_kernel_inst(seq[i]):
-                        desired_pos = i
-                        break
-                _logger.info(
-                    "collective_overlap_pass: moving %s from pos %d to %d "
-                    "(adds ~%.1f us of overlap, closes %.1f us deficit).",
-                    ag_start.name, ag_start_pos, desired_pos, accumulated, deficit,
-                )
-                new_seq = [inst for inst in seq if inst is not ag_start]
-                new_seq.insert(desired_pos, ag_start)
-                schedule.set_sequence(comp, new_seq)
-                seq = new_seq
-                positions = {inst: i for i, inst in enumerate(seq)}
-                changed = True
-            else:
-                # desired_pos < earliest_valid: operands sit between desired_pos
-                # and ag_start.  Try relocating them if they are all trivially
-                # movable (converts, transposes, elementwise fusions).
-                to_move = _collect_movable_operands(
-                    ag_start, desired_pos, ag_start_pos, positions
-                )
-                if to_move is None:
-                    _logger.debug(
-                        "collective_overlap_pass [%s]: %s cannot move "
-                        "(non-trivial operands in window, deficit=%.1f us).",
-                        module_name, ag_start.name, deficit,
-                    )
-                    if deficit >= _SPLIT_DEFICIT_THRESHOLD_US:
-                        eff_positions = [
-                            _effective_producer_pos(op, positions)
-                            for op in ag_start.operands()
-                        ]
-                        split_candidates.append(_SplitCandidate(
-                            start_name=ag_start.name,
-                            done_name=ag_done.name,
-                            deficit_us=deficit,
-                            comp_name=comp.name,
-                            effective_producer_pos=eff_positions,
-                        ))
-                    continue
+            to_move_set = set(to_move) | {ag_start}
+            # All moved items are at positions >= floor (a data/control
+            # predecessor can never sit after the instruction it gates), so
+            # the insertion index in the filtered new_seq equals floor.
+            new_seq = [inst for inst in seq if inst not in to_move_set]
+            ins_pos = floor
+            for inst in to_move:  # already in topological (schedule) order
+                new_seq.insert(ins_pos, inst)
+                ins_pos += 1
+            new_seq.insert(ins_pos, ag_start)
+            schedule.set_sequence(comp, new_seq)
+            seq = new_seq
+            positions = {inst: i for i, inst in enumerate(seq)}
+            name_to_pos = {inst.name: i for inst, i in positions.items()}
+            changed = True
 
-                _logger.info(
-                    "collective_overlap_pass: moving %s from pos %d to %d "
-                    "with %d relocated operands "
-                    "(adds ~%.1f us of overlap, closes %.1f us deficit).",
-                    ag_start.name, ag_start_pos, desired_pos,
-                    len(to_move), accumulated, deficit,
-                )
-                to_move_set = set(to_move) | {ag_start}
-                # All removed items are at positions >= desired_pos, so the
-                # insertion index in new_seq equals desired_pos.
-                new_seq = [inst for inst in seq if inst not in to_move_set]
-                ins_pos = desired_pos
-                for inst in to_move:  # already in topological (schedule) order
-                    new_seq.insert(ins_pos, inst)
-                    ins_pos += 1
-                new_seq.insert(ins_pos, ag_start)
-                schedule.set_sequence(comp, new_seq)
-                seq = new_seq
-                positions = {inst: i for i, inst in enumerate(seq)}
-                changed = True
+            new_ag_start_pos = positions[ag_start]
+            new_ag_done_pos = positions[ag_done]
+            new_overlap = sum(
+                _profile_costs.get(seq[i].name, 0.0)
+                for i in range(new_ag_start_pos + 1, new_ag_done_pos)
+            )
+            _logger.info(
+                "collective_overlap_pass: moving %s from pos %d to %d "
+                "with %d relocated operand(s) (overlap %.1f -> %.1f us, "
+                "latency=%.1f us).",
+                ag_start.name, ag_start_pos, new_ag_start_pos,
+                len(to_move), current_overlap, new_overlap, collective_latency,
+            )
+
+            if new_overlap < collective_latency:
+                remaining_deficit = collective_latency - new_overlap
+                if remaining_deficit >= _SPLIT_DEFICIT_THRESHOLD_US:
+                    eff_positions = [
+                        _effective_producer_pos(op, positions)
+                        for op in ag_start.operands()
+                    ]
+                    split_candidates.append(_SplitCandidate(
+                        start_name=ag_start.name,
+                        done_name=ag_done.name,
+                        deficit_us=remaining_deficit,
+                        comp_name=comp.name,
+                        effective_producer_pos=eff_positions,
+                    ))
 
     return changed, split_candidates
 
