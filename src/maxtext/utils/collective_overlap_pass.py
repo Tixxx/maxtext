@@ -988,7 +988,20 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             nr.opcode = inner_inst.opcode
             nr.operand_ids.extend(new_param_ids)
             nr.dimensions.extend(inner_inst.dimensions)
+            # Copy the replica-group spec verbatim. Modern XLA usually encodes
+            # this via collective_device_list (or iota_collective_device_list)
+            # rather than the legacy replica_groups field, which is then left
+            # empty — copying only replica_groups silently drops the real
+            # group, so the verifier falls back to inferring a full-device
+            # subgroup (e.g. 32) instead of the instruction's true, possibly
+            # smaller, subgroup (e.g. 8), tripping the shard_count ==
+            # subgroup_size RET_CHECK in hlo_verifier.cc.
             nr.replica_groups.extend(inner_inst.replica_groups)
+            if inner_inst.HasField("collective_device_list"):
+                nr.collective_device_list.CopyFrom(inner_inst.collective_device_list)
+            if inner_inst.HasField("iota_collective_device_list"):
+                nr.iota_collective_device_list.CopyFrom(inner_inst.iota_collective_device_list)
+            nr.use_global_device_ids = inner_inst.use_global_device_ids
             # Copy the to_apply reduction computation (e.g. add.47.clone)
             nr.called_computation_ids.extend(inner_inst.called_computation_ids)
             if inner_inst.channel_id:
