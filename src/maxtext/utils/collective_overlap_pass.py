@@ -1009,6 +1009,14 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             if _which_dl is not None:
                 getattr(nr, _which_dl).CopyFrom(getattr(inner_inst, _which_dl))
             nr.use_global_device_ids = inner_inst.use_global_device_ids
+            # collective-permute doesn't use replica_groups/device_list at all
+            # (HloCollectivePermuteInstruction extends HloChannelInstruction,
+            # not HloCollectiveInstruction) — its participants are defined
+            # entirely by source_target_pairs, which none of the copies above
+            # touch. Without this, a split collective-permute would silently
+            # get an empty pairing.
+            if inner_inst.opcode == "collective-permute":
+                nr.source_target_pairs.extend(inner_inst.source_target_pairs)
             # Copy the to_apply reduction computation (e.g. add.47.clone)
             nr.called_computation_ids.extend(inner_inst.called_computation_ids)
             if inner_inst.channel_id:
@@ -1286,6 +1294,13 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
 
     module_name = module.name
 
+    if os.environ.get("COLLECTIVE_OVERLAP_DUMP_MODULE", "1") == "1":
+        sys.stderr.write(
+            f"[collective_overlap_pass] === BEGIN ORIGINAL MODULE: {module_name} ===\n"
+            f"{module.to_string()}\n"
+            f"[collective_overlap_pass] === END ORIGINAL MODULE: {module_name} ===\n"
+        )
+
     # ---- Phase 1 ----
     changed, split_candidates = _phase1_reorder(module, schedule, module_name)
 
@@ -1305,9 +1320,24 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
         )
         phase2_bytes = _phase2_split(phase1_bytes, split_candidates)
         if phase2_bytes is not None:
-            return phase2_bytes
+            return _dump_final_module(module_name, phase2_bytes)
 
-    return phase1_bytes if changed else None
+    if changed:
+        return _dump_final_module(module_name, phase1_bytes)
+    return None
+
+
+def _dump_final_module(module_name: str, result_bytes: bytes) -> bytes:
+    """Log the module as it will actually be handed back to XLA, if enabled."""
+    if os.environ.get("COLLECTIVE_OVERLAP_DUMP_MODULE", "1") == "1":
+        from jax._src.lib import hlo as _hlo  # pylint: disable=import-outside-toplevel
+        _final_module = _hlo.HloModule.from_serialized_hlo_module_proto(result_bytes)
+        sys.stderr.write(
+            f"[collective_overlap_pass] === BEGIN FINAL MODULE: {module_name} ===\n"
+            f"{_final_module.to_string()}\n"
+            f"[collective_overlap_pass] === END FINAL MODULE: {module_name} ===\n"
+        )
+    return result_bytes
 
 
 # ---------------------------------------------------------------------------
