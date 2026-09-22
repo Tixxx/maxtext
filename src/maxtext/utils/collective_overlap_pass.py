@@ -997,10 +997,17 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             # smaller, subgroup (e.g. 8), tripping the shard_count ==
             # subgroup_size RET_CHECK in hlo_verifier.cc.
             nr.replica_groups.extend(inner_inst.replica_groups)
-            if inner_inst.HasField("collective_device_list"):
-                nr.collective_device_list.CopyFrom(inner_inst.collective_device_list)
-            if inner_inst.HasField("iota_collective_device_list"):
-                nr.iota_collective_device_list.CopyFrom(inner_inst.iota_collective_device_list)
+            # The modern replacement for replica_groups is the
+            # "replica_group_list" oneof (collective_device_list /
+            # iota_collective_device_list / mesh_axes_replica_group_list —
+            # the latter is what Shardy-partitioned modules use). Whichever
+            # variant is set, the participating-device grouping is identical
+            # across all split sub-collectives (splitting only partitions
+            # the operand/buffer list, not who talks to whom), so copy it
+            # verbatim.
+            _which_dl = inner_inst.WhichOneof("replica_group_list")
+            if _which_dl is not None:
+                getattr(nr, _which_dl).CopyFrom(getattr(inner_inst, _which_dl))
             nr.use_global_device_ids = inner_inst.use_global_device_ids
             # Copy the to_apply reduction computation (e.g. add.47.clone)
             nr.called_computation_ids.extend(inner_inst.called_computation_ids)
