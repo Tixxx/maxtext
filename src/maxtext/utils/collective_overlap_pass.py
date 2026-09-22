@@ -926,15 +926,34 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
                         _seen_gte_ids.add(next_id)
                     cur_id = next_id
                 group_op_ids.extend(reversed(intermediates))
-                # op_id itself must go through the same dedup: two different
-                # operand indices in this (or another) group can reference the
-                # exact same instruction (e.g. a combined all-gather whose
-                # operand tuple repeats a buffer), or one operand's own op_id
-                # can turn out to be an ancestor discovered while walking a
-                # later operand's chain. Either way it must only be relocated
-                # once — inserting the same instruction into the schedule
-                # twice trips XLA's schedule verifier (hlo_schedule.cc:439).
-                if op_id not in _seen_gte_ids:
+                # op_id itself only needs relocating when it is itself a
+                # zero-cost op (bitcast/GTE/tuple) directly feeding the
+                # collective-start — those must move together with the rest
+                # of the chain so the sub-start's operands stay contiguous.
+                # If op_id is instead the real (non-zero-cost) producer
+                # (e.g. a GEMM feeding the collective with no zero-cost
+                # wrapper), it must NOT be relocated: (1) moving a heavy
+                # compute instruction can violate other consumers' ordering,
+                # and (2) _proto_effective_pos(op_id) returns op_id's own
+                # schedule position as eff_pos, and removing op_id from the
+                # schedule invalidates that position in orig_to_compact,
+                # which then silently falls back to the raw (pre-removal)
+                # index — overshooting the true compact position badly
+                # enough that the sub-done can end up inserted before its
+                # own sub-start (RET_CHECK at hlo_schedule.cc:456).
+                #
+                # The dedup via _seen_gte_ids still applies: two different
+                # operand indices in this (or another) group can reference
+                # the exact same zero-cost instruction (e.g. a combined
+                # all-gather whose operand tuple repeats a buffer), or one
+                # operand's own op_id can turn out to be an ancestor
+                # discovered while walking a later operand's chain. Either
+                # way it must only be relocated once — inserting the same
+                # instruction into the schedule twice trips XLA's schedule
+                # verifier (hlo_schedule.cc:439).
+                _op_inst = id_to_inst.get(op_id)
+                if (_op_inst is not None and _op_inst.opcode in _ZERO_COST_OPS
+                        and op_id not in _seen_gte_ids):
                     group_op_ids.append(op_id)
                     _seen_gte_ids.add(op_id)
 
@@ -1081,15 +1100,29 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
                 orig_to_compact[_oi] = _cidx
                 _cidx += 1
 
+        def _compact_pos_at_or_before(pos: int) -> int:
+            # eff_pos should always land on a surviving instruction, but as
+            # defense-in-depth (in case some other candidate/op ends up
+            # removed at that exact position), snap to the nearest
+            # surviving position at or before it rather than falling back
+            # to the raw pre-removal index — using the raw index directly
+            # can overshoot into (or past) compact positions reserved for
+            # later insertions, e.g. the sub-done block, and cause the
+            # RET_CHECK ordering violation seen in hlo_schedule.cc:456.
+            for _p in range(pos, -1, -1):
+                if _p in orig_to_compact:
+                    return orig_to_compact[_p]
+            return 0
+
         # Insert each group's bitcasts + sub-start right after its GEMM.
         sorted_pairs = sorted(new_pairs, key=lambda x: x[3])
 
         for group, ns_id, nd_id, eff_pos, op_ids in sorted_pairs:
-            _cpct = orig_to_compact.get(eff_pos, eff_pos)
+            _cpct = _compact_pos_at_or_before(eff_pos)
             sys.stderr.write(f"[split_core] GROUP eff_pos={eff_pos} -> compact={_cpct}\n")
         offset = 0
         for group, ns_id, nd_id, eff_pos, op_ids in sorted_pairs:
-            compact_pos = orig_to_compact.get(eff_pos, eff_pos)
+            compact_pos = _compact_pos_at_or_before(eff_pos)
             ins_pos = compact_pos + 1 + offset
             # Reinsert the zero-cost operands first, then the sub-start.
             for _op_id in op_ids:
