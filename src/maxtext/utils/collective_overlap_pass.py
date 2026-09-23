@@ -123,6 +123,68 @@ def _update_profile(fdo_bytes: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-rank profile broadcast (mpi4py)
+# ---------------------------------------------------------------------------
+# Each rank's PGLE profile is measured independently from its own local NCCL/
+# kernel timings, which differ slightly rank-to-rank due to hardware/timing
+# noise. Since the pass's phase-1/phase-2 decisions (deficits, move targets,
+# split groupings) are a deterministic function of _profile_costs, different
+# _profile_costs across ranks can make different ranks schedule the *same*
+# SPMD program differently -- which is illegal (all ranks must compile an
+# identical executable). Broadcasting rank 0's profile and having every rank
+# overwrite its own _profile_costs with it makes the input to the pass
+# byte-identical everywhere, which makes its output identical everywhere too.
+_mpi_comm = None
+_mpi_checked = False
+
+
+def _get_mpi_comm():
+    """Lazily resolve MPI.COMM_WORLD, caching the result (including failure)."""
+    global _mpi_comm, _mpi_checked
+    if not _mpi_checked:
+        _mpi_checked = True
+        try:
+            from mpi4py import MPI  # pylint: disable=import-outside-toplevel
+            _mpi_comm = MPI.COMM_WORLD
+        except Exception as exc:  # pylint: disable=broad-except
+            _logger.warning(
+                "collective_overlap_pass: mpi4py unavailable (%s); cannot "
+                "broadcast the PGLE profile from rank 0, so each rank will "
+                "keep using its own locally-measured profile. This risks "
+                "the pass making different scheduling decisions on "
+                "different ranks.", exc,
+            )
+            _mpi_comm = None
+    return _mpi_comm
+
+
+def _broadcast_profile_costs() -> None:
+    """Overwrite _profile_costs on every rank with rank 0's copy via MPI.
+
+    Must be called by every rank that reaches this point in lockstep -- it's
+    a collective MPI call (Comm.bcast), so it relies on all ranks in
+    COMM_WORLD compiling the same sequence of modules (true for a normal
+    SPMD JAX training program, where every process runs identical Python
+    control flow).
+    """
+    comm = _get_mpi_comm()
+    if comm is None or comm.Get_size() == 1:
+        return
+    try:
+        is_root = comm.Get_rank() == 0
+        broadcasted = comm.bcast(dict(_profile_costs) if is_root else None, root=0)
+        if not is_root:
+            _profile_costs.clear()
+            _profile_costs.update(broadcasted)
+    except Exception as exc:  # pylint: disable=broad-except
+        _logger.warning(
+            "collective_overlap_pass: MPI broadcast of PGLE profile costs "
+            "failed (%s); falling back to this rank's own locally-measured "
+            "profile.", exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # POST_SCHEDULER pass — data structures
 # ---------------------------------------------------------------------------
 _ASYNC_DONE_PREFIXES = (
@@ -1283,6 +1345,14 @@ def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> O
 # ---------------------------------------------------------------------------
 def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
     """Phase 1: reorder; Phase 2: split batched collectives."""
+    # Sync _profile_costs to rank 0's copy before anything else in the pass
+    # runs (including the early-return below): every rank must reach this
+    # collective MPI call unconditionally, on every invocation, so that
+    # ranks never diverge on whether they call it (a rank returning early
+    # here because its own local _profile_costs was empty, while another
+    # rank still tries to broadcast, would deadlock).
+    _broadcast_profile_costs()
+
     if not _profile_costs:
         return None
 
