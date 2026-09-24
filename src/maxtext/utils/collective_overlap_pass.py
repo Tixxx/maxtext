@@ -19,11 +19,15 @@ Call ``register()`` once before the first ``jax.jit``-compiled function runs.
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import re
+import signal
+import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -123,7 +127,7 @@ def _update_profile(fdo_bytes: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cross-rank profile broadcast (mpi4py)
+# Cross-rank sync (JAX's own distributed coordination service)
 # ---------------------------------------------------------------------------
 # Each rank's PGLE profile is measured independently from its own local NCCL/
 # kernel timings, which differ slightly rank-to-rank due to hardware/timing
@@ -131,68 +135,120 @@ def _update_profile(fdo_bytes: bytes) -> None:
 # split groupings) are a deterministic function of _profile_costs, different
 # _profile_costs across ranks can make different ranks schedule the *same*
 # SPMD program differently -- which is illegal (all ranks must compile an
-# identical executable). Broadcasting rank 0's profile and having every rank
-# overwrite its own _profile_costs with it makes the input to the pass
-# byte-identical everywhere, which makes its output identical everywhere too.
-_mpi_comm = None
-_mpi_checked = False
+# identical executable).
+#
+# We used to fix this via an external cross-process broadcast library: first
+# by broadcasting rank 0's _profile_costs (syncing the *input*, which turned
+# out to be insufficient -- ranks still ended up with divergent schedules
+# even when their profile-cost inputs matched), then by having only rank 0
+# compute and broadcasting its *output* bytes (which sidesteps that, but
+# requires the external library's process group to actually span all ranks --
+# which in turn required extra Slurm launch flags that, on this cluster,
+# interfered with NCCL's own cross-node bootstrap and caused a *different*,
+# earlier hang).
+#
+# Tracing stock JAX/XLA's own AutoPGLE FDO-profile sync
+# (jax/_src/compiler.py:_share_fdo_profiles) shows it solves this exact
+# problem using infrastructure already built into JAX: JAX's own distributed
+# coordination service (jax._src.distributed.global_state.client -- the same
+# "Jax service"/"JAX distributed service" every one of these multi-process
+# jobs is already connected to, since that's how the processes form a
+# cluster in the first place) as a simple key-value store. A designated
+# process publishes bytes under a content-derived key; every other process
+# does a blocking read on that same key. No extra library, no barriers, no
+# extra Slurm launch flags, no risk of colliding with NCCL's bootstrap. We do
+# the same thing here, publishing the pass's *output* bytes (as established
+# above, the output-broadcast strategy is the one that actually eliminates
+# divergence) instead of the FDO profile.
+_dist_client = None
+_dist_checked = False
+
+# Monotonic count of _collective_overlap_pass invocations that proceeded
+# past the early-out (i.e. had an interesting async op to potentially
+# reorder). Used to name the entry barrier below -- see its call site for
+# why this needs to be call-order-based rather than content-hash-based.
+_barrier_invocation_count = 0
 
 
-def _get_mpi_comm():
-    """Lazily resolve MPI.COMM_WORLD, caching the result (including failure)."""
-    global _mpi_comm, _mpi_checked
-    if not _mpi_checked:
-        _mpi_checked = True
+def _get_distributed_client():
+    """Lazily resolve jax's distributed coordination-service client.
+
+    Logs the resolved process_id/process_count at INFO on every process so a
+    mis-launched job (e.g. jax.distributed.initialize() never called, or
+    called with num_processes=1) is immediately visible in the logs rather
+    than failing silently: a process_count=1 "world" makes every rank act as
+    its own root, which defeats the whole point of sharing rank 0's result
+    with everyone else.
+    """
+    global _dist_client, _dist_checked
+    if not _dist_checked:
+        _dist_checked = True
         try:
-            from mpi4py import MPI  # pylint: disable=import-outside-toplevel
-            _mpi_comm = MPI.COMM_WORLD
+            from jax._src import distributed as _jax_distributed  # pylint: disable=import-outside-toplevel
+            _dist_client = _jax_distributed.global_state.client
+            _process_id = _jax_distributed.global_state.process_id
+            _process_count = _jax_distributed.global_state.num_processes
+            _logger.info(
+                "collective_overlap_pass: JAX distributed client resolved: "
+                "process_id=%d process_count=%d (host=%s, pid=%d).%s",
+                _process_id, _process_count, socket.gethostname(), os.getpid(),
+                "" if (_dist_client is not None and _process_count > 1) else (
+                    " WARNING: client=%s process_count=%d means this process "
+                    "cannot share its scheduled module with other ranks -- "
+                    "every rank will compute its own (potentially divergent) "
+                    "schedule. This usually means jax.distributed.initialize() "
+                    "was never called, or was called with num_processes=1."
+                    % (_dist_client is not None, _process_count)
+                ),
+            )
         except Exception as exc:  # pylint: disable=broad-except
             _logger.warning(
-                "collective_overlap_pass: mpi4py unavailable (%s); cannot "
-                "broadcast the PGLE profile from rank 0, so each rank will "
-                "keep using its own locally-measured profile. This risks "
-                "the pass making different scheduling decisions on "
-                "different ranks.", exc,
+                "collective_overlap_pass: jax distributed client unavailable "
+                "(%s); cannot share rank 0's scheduled module, so each rank "
+                "will compute (and use) its own locally-scheduled module. "
+                "This risks ranks ending up with divergent schedules.", exc,
             )
-            _mpi_comm = None
-    return _mpi_comm
+            _dist_client = None
+    return _dist_client
 
 
-def _broadcast_profile_costs() -> None:
-    """Overwrite _profile_costs on every rank with rank 0's copy via MPI.
+def _jax_process_id() -> int:
+    from jax._src import distributed as _jax_distributed  # pylint: disable=import-outside-toplevel
+    return _jax_distributed.global_state.process_id
 
-    Must be called by every rank that reaches this point in lockstep -- it's
-    a collective MPI call (Comm.bcast), so it relies on all ranks in
-    COMM_WORLD compiling the same sequence of modules (true for a normal
-    SPMD JAX training program, where every process runs identical Python
-    control flow).
-    """
-    comm = _get_mpi_comm()
-    if comm is None or comm.Get_size() == 1:
-        return
-    try:
-        is_root = comm.Get_rank() == 0
-        broadcasted = comm.bcast(dict(_profile_costs) if is_root else None, root=0)
-        if not is_root:
-            _profile_costs.clear()
-            _profile_costs.update(broadcasted)
-    except Exception as exc:  # pylint: disable=broad-except
-        _logger.warning(
-            "collective_overlap_pass: MPI broadcast of PGLE profile costs "
-            "failed (%s); falling back to this rank's own locally-measured "
-            "profile.", exc,
-        )
+
+def _jax_process_count() -> int:
+    from jax._src import distributed as _jax_distributed  # pylint: disable=import-outside-toplevel
+    return _jax_distributed.global_state.num_processes
+
+
+# Timeout for the key-value share below. Mirrors JAX's own default for the
+# analogous FDO-profile share (jax_share_binary_between_hosts_timeout_ms).
+_SHARE_TIMEOUT_MS = int(
+    os.environ.get("COLLECTIVE_OVERLAP_SHARE_TIMEOUT_MS", str(20 * 60 * 1000))
+)
+
+# Sentinel prefix bytes distinguishing "no transformation" (None) from actual
+# module bytes in the key-value store, since the value there must be bytes.
+_SHARE_NONE = b"\x00"
+_SHARE_SOME = b"\x01"
 
 
 # ---------------------------------------------------------------------------
 # POST_SCHEDULER pass — data structures
 # ---------------------------------------------------------------------------
-_ASYNC_DONE_PREFIXES = (
-    "all-gather-done.",
-    "reduce-scatter-done.",
-    "all-reduce-done.",
-    "collective-permute-done.",
-)
+# Dedicated "Start" opcodes (kebab-case, via _opcode_str below) for async
+# collectives that have their own Start/Done opcode pair. Some collectives
+# (reduce-scatter, notably -- it has no dedicated Start/Done opcode pair at
+# all) are instead represented via the generic kAsyncStart/kAsyncDone
+# wrapper; unlike the dedicated opcodes, a generic "async-start" doesn't
+# need its wrapped op inspected to know it's worth scheduling -- it's async
+# by construction, so it's checked separately in _is_async_start below.
+_ASYNC_START_OPCODES = frozenset({
+    "all-gather-start",
+    "all-reduce-start",
+    "collective-permute-start",
+})
 
 # Minimum deficit (µs) to consider a collective for phase-2 splitting.
 # Override with COLLECTIVE_OVERLAP_DISABLE_SPLIT=1 to run baseline (no split).
@@ -219,8 +275,53 @@ class _SplitCandidate:
     effective_producer_pos: list[int] = field(default_factory=list)
 
 
-def _is_async_done(inst: object) -> bool:
-    return any(inst.name.startswith(p) for p in _ASYNC_DONE_PREFIXES)
+def _is_async_start(inst: object) -> bool:
+    """True if `inst` is the Start half of an async collective we care about.
+
+    Checked by opcode (via _opcode_str), not by instruction name -- names
+    are compiler-assigned labels (from user annotations, dedup, etc.), not
+    a reliable signal of what an instruction actually is; only the opcode
+    is authoritative. all-gather/all-reduce/collective-permute each have a
+    dedicated kXStart opcode for their async Start half
+    (_ASYNC_START_OPCODES). reduce-scatter has no dedicated Start/Done
+    opcode pair -- XLA represents it via the generic kAsyncStart/kAsyncDone
+    wrapper instead. A generic kAsyncStart doesn't need its wrapped op
+    inspected: being async at all is sufficient to know phase 1 should
+    consider scheduling it, so any "async-start" opcode counts directly.
+
+    Note: a plain collective-shaped instruction (e.g. a while-loop body's
+    ROOT all-gather) with collective_backend_config.is_sync=false is NOT a
+    separate case to handle here -- it's just the *inner* representation of
+    a normal async-start/async-done pair (the plain op is the ROOT of the
+    async_wrapped_computation an outer "async-start ... calls=%async_comp"
+    instruction calls). The outer async-start is what appears in the
+    schedule this function walks, and it's already covered by the
+    "async-start" opcode check above.
+    """
+    opcode = _opcode_str(inst)
+    return opcode in _ASYNC_START_OPCODES or opcode == "async-start"
+
+
+def _module_has_interesting_async_ops(module) -> bool:
+    """True if any non-fusion computation in the module has an async-start op.
+
+    Checked against every non-fusion computation (not just the entry one) --
+    an async-start can live inside a while-body/condition computation just
+    as well as the entry computation, and make_nonfusion_computations() is
+    the same accessor _innermost_first_computations() uses, so this sees
+    exactly the set of computations phase 1 would otherwise walk. Fusion
+    bodies are excluded since collectives never appear inside a fusion.
+
+    A cheap, single pass over instruction opcodes -- used as an early-out
+    before touching the distributed client/barrier at all, so the (much more
+    common) modules with no collectives to reorder skip all synchronization
+    overhead entirely.
+    """
+    for comp in module.make_nonfusion_computations():
+        for inst in comp.instructions():
+            if _is_async_start(inst):
+                return True
+    return False
 
 
 def _opcode_str(inst) -> str:
@@ -405,6 +506,11 @@ def _control_predecessor_names(inst) -> list[str]:
 
 _MAX_RELOCATE_CHAIN = 64
 
+# Minimum profiled cost (us) for a non-trivial instruction to be considered
+# a "heavy compute" worth relocating into an exposed collective's window --
+# below this it's not worth the bookkeeping/relocation churn.
+_HEAVY_COMPUTE_MIN_US = 5.0
+
 
 def _earliest_legal_pos(
     ag_start,
@@ -425,11 +531,16 @@ def _earliest_legal_pos(
     same way.
 
     Returns (floor, movable) where floor is the smallest legal insertion
-    position (in the current, pre-move schedule) and movable is the trivial
-    chain to relocate alongside ag_start (sorted in schedule order, excluding
-    ag_start itself).
+    position (in the current, pre-move schedule) and movable is the subset
+    of the trivial chain that actually needs to relocate alongside ag_start
+    (sorted in schedule order, excluding ag_start itself) -- i.e. those
+    chain members currently positioned at or after floor.  Chain members
+    already positioned before floor satisfy the ordering constraint as-is
+    and are left untouched; forcing them to move too would needlessly drag
+    ag_start's own final position later (floor + len(movable)), potentially
+    past its original position, negating the point of the move.
     """
-    movable: set = set()
+    candidates: set = set()
     seen: set = set()
     floor = 0
     queue = list(ag_start.operands())
@@ -440,14 +551,14 @@ def _earliest_legal_pos(
         seen.add(inst)
         if inst not in positions:
             continue
-        if len(movable) < _MAX_RELOCATE_CHAIN and _is_trivially_movable_inst(inst, comp_by_name):
-            movable.add(inst)
+        if len(candidates) < _MAX_RELOCATE_CHAIN and _is_trivially_movable_inst(inst, comp_by_name):
+            candidates.add(inst)
             queue.extend(inst.operands())
         else:
             floor = max(floor, positions[inst] + 1)
 
-    moving_names = {inst.name for inst in movable} | {ag_start.name}
-    for inst in list(movable) + [ag_start]:
+    moving_names = {inst.name for inst in candidates} | {ag_start.name}
+    for inst in list(candidates) + [ag_start]:
         for name in _control_predecessor_names(inst):
             if name in moving_names:
                 continue
@@ -455,7 +566,123 @@ def _earliest_legal_pos(
             if cp_pos is not None:
                 floor = max(floor, cp_pos + 1)
 
+    # floor only grows monotonically as the walk visits more of the operand
+    # tree, so a candidate discovered early on may already sit before the
+    # *final* floor -- only relocate the ones that don't.
+    movable = [inst for inst in candidates if positions[inst] >= floor]
     return floor, sorted(movable, key=lambda i: positions[i])
+
+
+def _fill_exposed_collectives_with_heavy_compute(
+    seq: list,
+    schedule,
+    comp,
+    start_of_done: dict,
+    positions: dict,
+    name_to_pos: dict,
+    comp_by_name: dict,
+    module_name: str,
+) -> tuple[bool, list, dict, dict]:
+    """Pull heavy compute instructions backward into earlier collectives'
+    still-exposed [start, done) windows, to help hide their latency.
+
+    Builds a bookkeeping list of every collective in `comp` that still has
+    unhidden latency (deficit > 0) after the start-relocation pass above,
+    ordered earliest-start-first. For each open window, scans forward from
+    its `done` instruction for a heavy compute instruction (a real kernel --
+    not a trivial bitcast/reshape/elementwise op -- with profiled cost at
+    or above _HEAVY_COMPUTE_MIN_US) whose own real dependencies (found the
+    same way _earliest_legal_pos finds them for a collective start) already
+    sit at or before the window's `done` instruction, and relocates it into
+    the window. Moving an instruction to an *earlier* position can never
+    violate its own downstream consumers: in any valid schedule a consumer
+    already sits after its producer, so it still sits after the new, even
+    earlier, position too -- only upstream (operand/control-predecessor)
+    dependencies need checking, which _earliest_legal_pos already does.
+    Repeats per window until its deficit is closed or no more legal
+    candidates remain, then moves on to the next window.
+    """
+    changed = False
+
+    windows: list[dict] = []
+    for ag_done, ag_start in start_of_done.items():
+        if ag_start not in positions or ag_done not in positions:
+            continue
+        try:
+            profile_key = ag_start.async_wrapped_root().name
+        except Exception:
+            profile_key = ag_start.name
+        latency = _profile_costs.get(profile_key)
+        if latency is None or latency <= 0:
+            continue
+        start_pos = positions[ag_start]
+        done_pos = positions[ag_done]
+        overlap = sum(
+            _profile_costs.get(seq[i].name, 0.0) for i in range(start_pos + 1, done_pos)
+        )
+        deficit = latency - overlap
+        if deficit > 0:
+            windows.append({"start": ag_start, "done": ag_done, "deficit": deficit})
+
+    if not windows:
+        return False, seq, positions, name_to_pos
+
+    windows.sort(key=lambda w: positions[w["start"]])
+    excluded = set(start_of_done.keys()) | set(start_of_done.values())
+
+    for window in windows:
+        while window["deficit"] > 0:
+            done_pos = positions[window["done"]]
+            start_pos = positions[window["start"]]
+            candidate = None
+            cand_floor = None
+            cand_chain: list = []
+            for i in range(done_pos + 1, len(seq)):
+                inst = seq[i]
+                if inst in excluded:
+                    continue
+                if _is_trivially_movable_inst(inst, comp_by_name):
+                    continue
+                cost = _profile_costs.get(inst.name, 0.0)
+                if cost < _HEAVY_COMPUTE_MIN_US:
+                    continue
+                floor, chain = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
+                if floor > done_pos:
+                    continue
+                candidate = inst
+                cand_floor = floor
+                cand_chain = chain
+                break
+
+            if candidate is None:
+                break
+
+            target = max(cand_floor, start_pos + 1)
+            to_move_set = set(cand_chain) | {candidate}
+            new_seq = [inst for inst in seq if inst not in to_move_set]
+            ins_pos = target
+            for inst in cand_chain:  # already in topological (schedule) order
+                new_seq.insert(ins_pos, inst)
+                ins_pos += 1
+            new_seq.insert(ins_pos, candidate)
+            schedule.set_sequence(comp, new_seq)
+            seq = new_seq
+            positions = {inst: i for i, inst in enumerate(seq)}
+            name_to_pos = {inst.name: i for inst, i in positions.items()}
+            changed = True
+
+            cost = _profile_costs.get(candidate.name, 0.0)
+            prev_deficit = window["deficit"]
+            window["deficit"] = max(0.0, window["deficit"] - cost)
+            _logger.info(
+                "collective_overlap_pass [%s]: relocated heavy compute %s "
+                "(cost %.1f us) into exposed window of %s (window deficit "
+                "%.1f -> %.1f us).",
+                module_name, candidate.name, cost, window["start"].name,
+                prev_deficit, window["deficit"],
+            )
+
+    return changed, seq, positions, name_to_pos
 
 
 # ---------------------------------------------------------------------------
@@ -549,10 +776,16 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
 
         start_of_done: dict = {}
         for inst in seq:
-            if _is_async_done(inst):
-                ops = list(inst.operands())
-                if ops:
-                    start_of_done[inst] = ops[0]
+            if _is_async_start(inst):
+                users = list(inst.users())
+                if len(users) == 1:
+                    start_of_done[users[0]] = inst
+                else:
+                    _logger.debug(
+                        "collective_overlap_pass [%s]: async-start %s has "
+                        "%d users (expected exactly 1, its done); skipping.",
+                        module_name, inst.name, len(users),
+                    )
 
         if not start_of_done:
             continue
@@ -674,6 +907,36 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                         comp_name=comp.name,
                         effective_producer_pos=eff_positions,
                     ))
+
+        heavy_changed, seq, positions, name_to_pos = _fill_exposed_collectives_with_heavy_compute(
+            seq, schedule, comp, start_of_done, positions, name_to_pos, comp_by_name, module_name,
+        )
+        if heavy_changed:
+            changed = True
+            # Some split candidates queued above may now be (partially or
+            # fully) hidden by a relocated heavy compute -- drop any whose
+            # collective is no longer under-hidden, so phase 2 doesn't pay
+            # split overhead for a deficit that no longer exists.
+            still_needed = []
+            for cand in split_candidates:
+                if cand.comp_name != comp.name:
+                    still_needed.append(cand)
+                    continue
+                start_pos = name_to_pos.get(cand.start_name)
+                done_pos = name_to_pos.get(cand.done_name)
+                if start_pos is None or done_pos is None:
+                    still_needed.append(cand)
+                    continue
+                overlap = sum(
+                    _profile_costs.get(seq[i].name, 0.0)
+                    for i in range(start_pos + 1, done_pos)
+                )
+                latency = overlap + cand.deficit_us
+                remaining = latency - overlap
+                if remaining >= _SPLIT_DEFICIT_THRESHOLD_US:
+                    cand.deficit_us = remaining
+                    still_needed.append(cand)
+            split_candidates = still_needed
 
     return changed, split_candidates
 
@@ -1343,16 +1606,14 @@ def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> O
 # ---------------------------------------------------------------------------
 # Top-level POST_SCHEDULER pass entry point
 # ---------------------------------------------------------------------------
-def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
-    """Phase 1: reorder; Phase 2: split batched collectives."""
-    # Sync _profile_costs to rank 0's copy before anything else in the pass
-    # runs (including the early-return below): every rank must reach this
-    # collective MPI call unconditionally, on every invocation, so that
-    # ranks never diverge on whether they call it (a rank returning early
-    # here because its own local _profile_costs was empty, while another
-    # rank still tries to broadcast, would deadlock).
-    _broadcast_profile_costs()
+def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
+    """Phase 1: reorder; Phase 2: split batched collectives.
 
+    This is the actual (rank-local) computation. It is only ever invoked on
+    rank 0 -- see _collective_overlap_pass below, which broadcasts rank 0's
+    *output* to every other rank instead of having each rank compute its own
+    (potentially divergent) answer.
+    """
     if not _profile_costs:
         return None
 
@@ -1397,6 +1658,301 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
     return None
 
 
+def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
+    """Share rank 0's fully scheduled module with every rank.
+
+    Every rank must compile a byte-identical executable. Rather than trying
+    to keep the *inputs* to the (deterministic-in-theory) reorder/split
+    algorithm in sync across ranks -- which proved insufficient: syncing
+    _profile_costs alone still left ranks with divergent schedules, likely
+    because the algorithm's output is sensitive to more than just the cost
+    data -- we sidestep the whole class of divergence by only ever running
+    the computation on rank 0 and sharing its *output* bytes with everyone
+    else. Every rank (including rank 0) ends up returning the exact same
+    bytes, so there is no way for schedules to diverge.
+
+    The sync uses JAX's own distributed coordination-service key-value store
+    (see jax/_src/compiler.py:_share_fdo_profiles for the stock-XLA analog:
+    AutoPGLE syncs FDO profile bytes the exact same way).
+
+    Both the KV-share key and the barrier names (below) are keyed by a
+    per-process invocation counter (_barrier_invocation_count), not by a
+    hash of the module content. Content-hashing was tried first (first the
+    raw serialized_hlo bytes, then module.to_string()) and both broke in
+    practice: two ranks' modules were repeatedly observed to be genuinely,
+    provably semantically identical -- same shapes, same everything that
+    matters for correctness -- yet still hash differently, because of
+    non-deterministic-but-harmless serialization details with no bearing on
+    program behavior (a per-compile-unique-id-like field in the raw proto
+    in one case; a JSON key insertion order inside an opaque cuDNN
+    backend_config string field in another -- e.g. {"24":"0","17":"1"} vs
+    {"17":"1","24":"0"}, same tuning knobs, different order). Any such
+    mismatch is permanent: rank 0 only ever publishes under the hash *it*
+    computed, so a rank whose hash differs waits on a key that will never
+    arrive. A call-order-based key sidesteps the entire class of problem --
+    it doesn't care what's inside the module, only that every rank reaches
+    this invocation in the same relative order, which we've verified
+    empirically holds (matching ENTER/EXIT and barrier counts across ranks
+    in every run so far).
+
+    Rank 0 publishing while every other rank reads by itself is NOT enough
+    to guarantee correctness, though: rank 0 never reads a key back (it
+    only ever calls key_value_set_bytes, which returns as soon as the write
+    lands -- it doesn't wait for anyone to consume it), so nothing stops
+    rank 0 racing ahead through many further compiles/eager executions
+    while other ranks sit blocked in blocking_key_value_get_bytes waiting
+    for a not-yet-reached invocation. If one of those later, rank-0-only
+    compiles eagerly executes an op needing a *real* cross-rank NCCL
+    collective (observed: the MoE EP "borrowed comm" bootstrap creating the
+    world clique), rank 0 ends up waiting on ranks that can never join,
+    because they're each frozen earlier, waiting on a rank 0 that isn't
+    coming back -- a genuine circular deadlock, distinct from the schedule
+    divergence the key-value share otherwise fixes.
+
+    The entry/exit barriers below (client.wait_at_barrier -- also a raw
+    coordination-service RPC, safe to call from within this compiler
+    callback, unlike jax.experimental.multihost_utils' barrier/broadcast
+    helpers, which compile and run an actual jax.jit'd collective and would
+    be an unsafe reentrant compile from in here) close that gap: no rank
+    (rank 0 included) can leave one invocation before every rank has
+    arrived at it and every rank has left it, so rank 0 can never get more
+    than one invocation ahead of the slowest rank.
+    """
+    global _barrier_invocation_count
+
+    # First statement in the function, deliberately as cheap as possible
+    # (just os.getpid()/socket.gethostname(), nothing that touches JAX or
+    # the distributed client yet) so this log line reliably fires the
+    # instant XLA calls into this pass -- confirming the callback was
+    # actually entered for this compile, as opposed to a hang happening
+    # entirely inside XLA's C++ compiler *before* it ever reaches Python.
+    _t_enter = time.monotonic()
+    _logger.info(
+        "collective_overlap_pass: ENTER host=%s pid=%d input_bytes=%d",
+        socket.gethostname(), os.getpid(), len(serialized_hlo),
+    )
+
+    # Early-out before touching the distributed client/barrier at all: the
+    # (much more common) modules with no async-done op anywhere -- tiny
+    # utility ops like jit_broadcast_in_dim, jit_convert_element_type, etc.
+    # -- have nothing for this pass to reorder, so there's no reason to pay
+    # any synchronization cost for them at all.
+    from jax._src.lib import hlo as _hlo  # pylint: disable=import-outside-toplevel
+    module = _hlo.HloModule.from_serialized_hlo_module_proto(serialized_hlo)
+    if not _module_has_interesting_async_ops(module):
+        _logger.info(
+            "collective_overlap_pass: SKIP host=%s pid=%d module=%s (no "
+            "async-done ops of interest; +%.1f ms since ENTER).",
+            socket.gethostname(), os.getpid(), module.name,
+            (time.monotonic() - _t_enter) * 1000,
+        )
+        _logger.info(
+            "collective_overlap_pass: EXIT host=%s pid=%d result=no-op "
+            "(skipped) (total %.1f ms since ENTER).",
+            socket.gethostname(), os.getpid(),
+            (time.monotonic() - _t_enter) * 1000,
+        )
+        return None
+
+    client = _get_distributed_client()
+    _in_rank = _jax_process_id() if client is not None else 0
+
+    # Content-identity for this invocation -- diagnostic only (see
+    # PRE-PASS INPUT HASH below), NOT used as the KV-share/barrier key
+    # (see the docstring for why content-hashing, of either the raw
+    # serialized_hlo bytes or this module.to_string() text, proved
+    # unreliable for that and was replaced with the call-order-based
+    # _barrier_invocation_count). Still useful here as a quick way to spot,
+    # by eye or by `grep PRE-PASS INPUT HASH`, whether two ranks' modules
+    # for the same invocation actually match or not, and if not, to diff
+    # the accompanying text dumps to see exactly what differs.
+    import hashlib as _hashlib  # pylint: disable=import-outside-toplevel
+    _module_text = module.to_string()
+    _content_digest = _hashlib.sha256(_module_text.encode()).hexdigest()
+
+    # Dump the raw INPUT module -- exactly what XLA handed us, before any
+    # pass logic (reorder/split/sync) has touched it -- unconditionally, for
+    # every rank (not just rank 0, unlike the BEGIN ORIGINAL MODULE dump
+    # inside _compute_collective_overlap, which only ever runs on rank 0).
+    # This is what actually lets us diff whether two ranks' local HLO for
+    # "the same" logical invocation is truly identical or not, rather than
+    # inferring it indirectly from KV-share key mismatches.
+    if os.environ.get("COLLECTIVE_OVERLAP_DUMP_MODULE", "1") == "1":
+        _in_host = socket.gethostname()
+        _in_pid = os.getpid()
+        _logger.info(
+            "collective_overlap_pass: PRE-PASS INPUT HASH rank=%d host=%s "
+            "pid=%d module=%s sha256=%s bytes=%d text_bytes=%d",
+            _in_rank, _in_host, _in_pid, module.name, _content_digest,
+            len(serialized_hlo), len(_module_text),
+        )
+        sys.stderr.write(
+            f"[collective_overlap_pass] === BEGIN PRE-PASS INPUT MODULE "
+            f"(rank={_in_rank} host={_in_host} pid={_in_pid} "
+            f"module={module.name} sha256={_content_digest}) ===\n"
+            f"{_module_text}\n"
+            f"[collective_overlap_pass] === END PRE-PASS INPUT MODULE "
+            f"(rank={_in_rank} module={module.name}) ===\n"
+        )
+
+    is_root = client is None or _in_rank == 0
+    multi_process = client is not None and _jax_process_count() > 1
+    _logger.info(
+        "collective_overlap_pass: resolved is_root=%s multi_process=%s "
+        "(+%.1f ms since ENTER).",
+        is_root, multi_process, (time.monotonic() - _t_enter) * 1000,
+    )
+
+    # Entry barrier: every rank (including rank 0) must arrive here before
+    # any rank proceeds -- see the docstring for why this is the piece that
+    # actually bounds rank 0's ability to race ahead.
+    _entry_name = _exit_name = None
+    if multi_process:
+        _barrier_invocation_count += 1
+        _entry_name = f"collective_overlap_pass_entry_{_barrier_invocation_count}"
+        _exit_name = f"collective_overlap_pass_exit_{_barrier_invocation_count}"
+        _rank_for_log = _jax_process_id()
+        try:
+            _logger.info(
+                "collective_overlap_pass: ENTRY BARRIER BEGIN rank=%d "
+                "name=%s.", _rank_for_log, _entry_name,
+            )
+            client.wait_at_barrier(_entry_name, _SHARE_TIMEOUT_MS)
+            _logger.info(
+                "collective_overlap_pass: ENTRY BARRIER END rank=%d "
+                "name=%s.", _rank_for_log, _entry_name,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            _logger.warning(
+                "collective_overlap_pass: entry barrier %s failed (%s); "
+                "proceeding without it -- this reintroduces the pacing "
+                "risk the barrier exists to close.", _entry_name, exc,
+            )
+
+    result_bytes: Optional[bytes] = None
+    if is_root:
+        _t_compute = time.monotonic()
+        _logger.info("collective_overlap_pass: _compute_collective_overlap BEGIN.")
+        result_bytes = _compute_collective_overlap(serialized_hlo)
+        _logger.info(
+            "collective_overlap_pass: _compute_collective_overlap END (%s, "
+            "%.1f ms).",
+            "no-op" if result_bytes is None else f"{len(result_bytes)} bytes",
+            (time.monotonic() - _t_compute) * 1000,
+        )
+
+    if multi_process:
+        _key = f"collective_overlap_pass_kv_{_barrier_invocation_count}"
+        _rank_for_log = _jax_process_id()
+        _host_for_log = socket.gethostname()
+        _pid_for_log = os.getpid()
+        try:
+            if is_root:
+                _payload = (
+                    _SHARE_NONE if result_bytes is None else _SHARE_SOME + result_bytes
+                )
+                _logger.info(
+                    "collective_overlap_pass: KV SET BEGIN rank=%d host=%s "
+                    "pid=%d key=%s (%s).",
+                    _rank_for_log, _host_for_log, _pid_for_log, _key,
+                    "no-op" if result_bytes is None else f"{len(result_bytes)} bytes",
+                )
+                client.key_value_set_bytes(_key, _payload)
+                _logger.info(
+                    "collective_overlap_pass: KV SET END rank=%d host=%s "
+                    "pid=%d key=%s.", _rank_for_log, _host_for_log, _pid_for_log, _key,
+                )
+            else:
+                _logger.info(
+                    "collective_overlap_pass: KV GET BEGIN rank=%d host=%s "
+                    "pid=%d key=%s (waiting up to %d ms for process 0 to "
+                    "share).", _rank_for_log, _host_for_log, _pid_for_log,
+                    _key, _SHARE_TIMEOUT_MS,
+                )
+                _payload = client.blocking_key_value_get_bytes(_key, _SHARE_TIMEOUT_MS)
+                result_bytes = (
+                    None if _payload == _SHARE_NONE else _payload[len(_SHARE_SOME):]
+                )
+                _logger.info(
+                    "collective_overlap_pass: KV GET END rank=%d host=%s "
+                    "pid=%d key=%s (%s).",
+                    _rank_for_log, _host_for_log, _pid_for_log, _key,
+                    "no-op" if result_bytes is None else f"{len(result_bytes)} bytes",
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            _logger.warning(
+                "collective_overlap_pass: sharing final scheduled module via "
+                "the JAX distributed client failed (%s); falling back to "
+                "this rank's own locally-computed result. This risks ranks "
+                "ending up with divergent schedules.", exc,
+            )
+            if not is_root:
+                result_bytes = _compute_collective_overlap(serialized_hlo)
+
+        # Exit barrier: mirrors the entry barrier -- no rank leaves this
+        # invocation until every rank has both arrived at and finished it,
+        # so rank 0 can't move on to the next invocation (or to backend
+        # compiling/eagerly executing this one) while a slower rank is
+        # still waiting on the KV share above.
+        try:
+            _logger.info(
+                "collective_overlap_pass: EXIT BARRIER BEGIN rank=%d "
+                "name=%s.", _rank_for_log, _exit_name,
+            )
+            client.wait_at_barrier(_exit_name, _SHARE_TIMEOUT_MS)
+            _logger.info(
+                "collective_overlap_pass: EXIT BARRIER END rank=%d "
+                "name=%s.", _rank_for_log, _exit_name,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            _logger.warning(
+                "collective_overlap_pass: exit barrier %s failed (%s); "
+                "proceeding without it -- this reintroduces the pacing "
+                "risk the barrier exists to close.", _exit_name, exc,
+            )
+
+    # Dump what THIS rank ends up returning, post-share, unconditionally
+    # (unlike _dump_final_module inside _compute_collective_overlap, which
+    # only ever runs on rank 0). Prefixing every line with rank/host/pid and
+    # a content hash lets us grep across all ranks' log files and confirm
+    # the share actually produced byte-identical modules everywhere --
+    # e.g. `grep "POST-SHARE HASH" output-*.txt | sort | uniq -c` should
+    # show exactly one distinct hash per module name if the share worked.
+    if result_bytes is not None and os.environ.get(
+        "COLLECTIVE_OVERLAP_DUMP_MODULE", "1"
+    ) == "1":
+        import hashlib as _hashlib  # pylint: disable=import-outside-toplevel
+        _rank = _jax_process_id()
+        _host = socket.gethostname()
+        _pid = os.getpid()
+        _digest = _hashlib.sha256(result_bytes).hexdigest()
+        from jax._src.lib import hlo as _hlo  # pylint: disable=import-outside-toplevel
+        _final_module = _hlo.HloModule.from_serialized_hlo_module_proto(result_bytes)
+        _module_name = _final_module.name
+        _logger.info(
+            "collective_overlap_pass: POST-SHARE HASH rank=%d host=%s "
+            "pid=%d module=%s sha256=%s bytes=%d",
+            _rank, _host, _pid, _module_name, _digest, len(result_bytes),
+        )
+        sys.stderr.write(
+            f"[collective_overlap_pass] === BEGIN POST-SHARE MODULE "
+            f"(rank={_rank} host={_host} pid={_pid} module={_module_name} "
+            f"sha256={_digest}) ===\n"
+            f"{_final_module.to_string()}\n"
+            f"[collective_overlap_pass] === END POST-SHARE MODULE "
+            f"(rank={_rank} module={_module_name}) ===\n"
+        )
+
+    _logger.info(
+        "collective_overlap_pass: EXIT host=%s pid=%d result=%s "
+        "(total %.1f ms since ENTER).",
+        socket.gethostname(), os.getpid(),
+        "no-op" if result_bytes is None else f"{len(result_bytes)} bytes",
+        (time.monotonic() - _t_enter) * 1000,
+    )
+    return result_bytes
+
+
 def _dump_final_module(module_name: str, result_bytes: bytes) -> bytes:
     """Log the module as it will actually be handed back to XLA, if enabled."""
     if os.environ.get("COLLECTIVE_OVERLAP_DUMP_MODULE", "1") == "1":
@@ -1439,6 +1995,24 @@ def _patch_pgle_profiler() -> None:
 # ---------------------------------------------------------------------------
 def register() -> None:
     """Register the collective-overlap POST_SCHEDULER pass and PGLE hook."""
+    # A hang inside XLA's own C++ compiler (as opposed to inside this
+    # pass's Python code) leaves no further log lines and is invisible to
+    # gdb/py-spy from outside the container (mount/pid namespace entry via
+    # nsenter/enroot exec requires privileges we don't have on this
+    # cluster). faulthandler sidesteps all of that: it writes directly to
+    # this process's own stderr (captured in its output-*.txt like
+    # everything else) on receipt of a signal, so diagnosing a hang is just
+    # `kill -USR1 <pid>` from any session that can see the pid (e.g. `srun
+    # --overlap --jobid=<job> -w <host> kill -USR1 <pid>`, no namespace
+    # entry needed) using the rank/host/pid already logged by every
+    # "... rank=%d host=%s pid=%d ..." line in this module.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    _logger.info(
+        "collective_overlap_pass: registered SIGUSR1 handler (faulthandler, "
+        "all_threads=True) -- send SIGUSR1 to this process to dump every "
+        "thread's Python traceback to stderr without needing gdb/"
+        "container namespace access."
+    )
     if os.environ.get("COLLECTIVE_OVERLAP_DISABLE", "0") == "1":
         _logger.info("collective_overlap_pass: disabled via COLLECTIVE_OVERLAP_DISABLE=1")
         return
