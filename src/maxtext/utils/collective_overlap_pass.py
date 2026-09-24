@@ -517,7 +517,7 @@ def _earliest_legal_pos(
     positions: dict,
     name_to_pos: dict,
     comp_by_name: dict,
-) -> tuple[int, list]:
+) -> tuple[int, list, object]:
     """Compute the earliest position ag_start can legally be relocated to.
 
     Walks ag_start's operands transitively through trivially-movable
@@ -530,19 +530,25 @@ def _earliest_legal_pos(
     is not itself part of the moving set pins a control-dependency floor the
     same way.
 
-    Returns (floor, movable) where floor is the smallest legal insertion
-    position (in the current, pre-move schedule) and movable is the subset
-    of the trivial chain that actually needs to relocate alongside ag_start
-    (sorted in schedule order, excluding ag_start itself) -- i.e. those
-    chain members currently positioned at or after floor.  Chain members
-    already positioned before floor satisfy the ordering constraint as-is
-    and are left untouched; forcing them to move too would needlessly drag
-    ag_start's own final position later (floor + len(movable)), potentially
-    past its original position, negating the point of the move.
+    Returns (floor, movable, blocker) where floor is the smallest legal
+    insertion position (in the current, pre-move schedule) and movable is
+    the subset of the trivial chain that actually needs to relocate
+    alongside ag_start (sorted in schedule order, excluding ag_start itself)
+    -- i.e. those chain members currently positioned at or after floor.
+    Chain members already positioned before floor satisfy the ordering
+    constraint as-is and are left untouched; forcing them to move too would
+    needlessly drag ag_start's own final position later (floor +
+    len(movable)), potentially past its original position, negating the
+    point of the move. blocker is the single non-trivial *data*-dependency
+    instruction whose position actually pins floor (None if floor is 0, or
+    if what pins it is a control-predecessor rather than a data producer) --
+    callers can try relocating a movable blocker earlier in its own right to
+    see if that opens up more room.
     """
     candidates: set = set()
     seen: set = set()
     floor = 0
+    blocker = None
     queue = list(ag_start.operands())
     while queue:
         inst = queue.pop()
@@ -555,7 +561,9 @@ def _earliest_legal_pos(
             candidates.add(inst)
             queue.extend(inst.operands())
         else:
-            floor = max(floor, positions[inst] + 1)
+            if positions[inst] + 1 > floor:
+                floor = positions[inst] + 1
+                blocker = inst
 
     moving_names = {inst.name for inst in candidates} | {ag_start.name}
     for inst in list(candidates) + [ag_start]:
@@ -563,14 +571,235 @@ def _earliest_legal_pos(
             if name in moving_names:
                 continue
             cp_pos = name_to_pos.get(name)
-            if cp_pos is not None:
-                floor = max(floor, cp_pos + 1)
+            if cp_pos is not None and cp_pos + 1 > floor:
+                floor = cp_pos + 1
+                blocker = None  # a control-predecessor, not a relocatable data producer
 
     # floor only grows monotonically as the walk visits more of the operand
     # tree, so a candidate discovered early on may already sit before the
     # *final* floor -- only relocate the ones that don't.
     movable = [inst for inst in candidates if positions[inst] >= floor]
-    return floor, sorted(movable, key=lambda i: positions[i])
+    return floor, sorted(movable, key=lambda i: positions[i]), blocker
+
+
+# Bound on how many times, per collective, we chase "the blocker's own
+# blocker" earlier (e.g. a GEMM blocked by an even earlier GEMM). The chain
+# is meant to be walked in full, all the way back to the computation's true
+# inputs (parameters) or another collective's done -- each hop's own
+# _earliest_legal_pos call already has no distance bound, and the loop
+# self-terminates the moment a blocker has no legal room left (or is too
+# cheap to bother relocating). This cap only guards against a pathological
+# or buggy chain that never terminates; it should not normally be reached.
+_MAX_PRODUCER_RELOCATE_HOPS = 64
+
+
+def _prefix_costs_excluding(seq: list, exclude: set) -> list:
+    """Prefix sum of profile costs along `seq`, with instructions in
+    `exclude` contributing 0 -- lets overlap for a hypothetical position be
+    computed without those instructions' cost being double-counted at both
+    their old and a candidate new position."""
+    prefix = [0.0] * (len(seq) + 1)
+    for i, inst in enumerate(seq):
+        c = 0.0 if inst in exclude else _profile_costs.get(inst.name, 0.0)
+        prefix[i + 1] = prefix[i] + c
+    return prefix
+
+
+def _total_exposed_us(start_of_done: dict, positions: dict, seq: list) -> float:
+    """Sum of positive deficits (exposed/un-hidden latency) across every
+    collective in `start_of_done` with a known profile cost, using the
+    schedule exactly as it stands -- the ground-truth "how much is exposed
+    right now, everywhere" metric used to decide whether a candidate
+    relocation is a net win or a net loss."""
+    prefix = _prefix_costs_excluding(seq, ())
+    total = 0.0
+    for ag_done, ag_start in start_of_done.items():
+        if ag_start not in positions or ag_done not in positions:
+            continue
+        try:
+            profile_key = ag_start.async_wrapped_root().name
+        except Exception:
+            profile_key = ag_start.name
+        latency = _profile_costs.get(profile_key)
+        if latency is None or latency <= 0:
+            continue
+        s, d = positions[ag_start], positions[ag_done]
+        overlap = prefix[d] - prefix[s + 1] if d > s + 1 else 0.0
+        total += max(0.0, latency - overlap)
+    return total
+
+
+def _find_best_blocker_position(
+    blocker,
+    chain: list,
+    floor: int,
+    blocker_pos: int,
+    ag_start,
+    ag_done_pos: int,
+    ag_latency: float,
+    start_of_done: dict,
+    positions: dict,
+    seq: list,
+) -> tuple[int, float]:
+    """Search positions in [floor, blocker_pos] for the one that minimizes
+    TOTAL exposed time summed across every collective in this computation --
+    not just the one `blocker` is currently pinning -- rather than always
+    relocating all the way to the theoretical-earliest floor.
+
+    Relocating blocker to position P affects two kinds of window:
+      - ag_start's own window: once blocker (and its trivial chain) lands
+        at P, ag_start's own new floor becomes P + len(chain) + 1, so its
+        overlap is recomputed directly against that hypothetical position.
+      - every *other* collective's window [start2, done2): if blocker
+        currently sits inside it but wouldn't at P, that window LOSES
+        blocker's cost from its overlap; if the reverse, it GAINS blocker's
+        cost. Windows containing both, neither, or unaffected by the move
+        see no change. (Chain members are themselves trivial -- bitcast /
+        reshape / GTE / elementwise -- so they carry ~0 profiled cost and
+        are ignored for this windowing accounting; only blocker's own
+        placement matters.)
+
+    This is an approximation (pre-move positions are used to decide window
+    containment for candidates, and chain members straddling a window
+    boundary aren't split out individually), but it is cheap -- O(number of
+    collectives) per candidate position -- and catches the dominant effect:
+    relocating a heavy op out of a stretch of the schedule that other,
+    already-hidden collectives were relying on for their own overlap.
+
+    Returns (best_pos, best_total_exposed_us). best_pos == blocker_pos
+    means no earlier position actually reduces total exposed time, i.e.
+    don't move blocker at all.
+    """
+    prefix = _prefix_costs_excluding(seq, set(chain) | {blocker})
+    block_cost = _profile_costs.get(blocker.name, 0.0)
+
+    other_windows = []  # (start_pos, done_pos, latency, base_overlap_excl_block)
+    for od, os in start_of_done.items():
+        if os is ag_start or os not in positions or od not in positions:
+            continue
+        try:
+            profile_key = os.async_wrapped_root().name
+        except Exception:
+            profile_key = os.name
+        latency2 = _profile_costs.get(profile_key)
+        if latency2 is None or latency2 <= 0:
+            continue
+        s2, d2 = positions[os], positions[od]
+        base_overlap = prefix[d2] - prefix[s2 + 1] if d2 > s2 + 1 else 0.0
+        other_windows.append((s2, d2, latency2, base_overlap))
+
+    # Only positions where some window's containment of blocker could
+    # actually flip are worth evaluating -- the floor, the original spot,
+    # and every other collective's start/done boundary in between.
+    candidates = {floor, blocker_pos}
+    for s2, d2, _, _ in other_windows:
+        if floor <= s2 < blocker_pos:
+            candidates.add(s2 + 1)
+        if floor < d2 <= blocker_pos:
+            candidates.add(d2)
+    candidates = sorted(p for p in candidates if floor <= p <= blocker_pos)
+
+    def total_exposed(P: int) -> float:
+        blocker_new_pos = P + len(chain)
+        ag_new_start = blocker_new_pos + 1
+        ag_overlap = (
+            prefix[ag_done_pos] - prefix[ag_new_start] if ag_done_pos > ag_new_start else 0.0
+        )
+        total = max(0.0, ag_latency - ag_overlap)
+        for s2, d2, latency2, base_overlap in other_windows:
+            contains_new = s2 < blocker_new_pos < d2
+            overlap2 = base_overlap + (block_cost if contains_new else 0.0)
+            total += max(0.0, latency2 - overlap2)
+        return total
+
+    best_pos, best_exposed = blocker_pos, None
+    for P in candidates:
+        e = total_exposed(P)
+        # Prefer strictly lower total exposed time; on a tie, prefer the
+        # position closest to blocker_pos (the least disruptive change that
+        # achieves the same result).
+        if best_exposed is None or e < best_exposed - 1e-6 or (
+            abs(e - best_exposed) <= 1e-6 and P > best_pos
+        ):
+            best_exposed = e
+            best_pos = P
+    return best_pos, best_exposed
+
+
+def _try_relocate_blocker_earlier(
+    blocker,
+    comp,
+    schedule,
+    seq: list,
+    positions: dict,
+    name_to_pos: dict,
+    comp_by_name: dict,
+    ag_start,
+    ag_done_pos: int,
+    ag_latency: float,
+    start_of_done: dict,
+):
+    """If `blocker` -- a non-trivial instruction pinning some collective's
+    floor -- is itself a movable heavy op, relocate it (and its own trivial
+    operand chain) to whichever legal position between its current spot and
+    its own theoretical-earliest floor minimizes TOTAL exposed time across
+    every collective in this computation (see _find_best_blocker_position) --
+    not necessarily all the way to that floor.
+
+    Moving a producer to an earlier position can never break its own
+    downstream consumers: in any valid schedule a consumer already sits
+    after its producer, so it still does after the producer moves to an
+    even earlier (but still legal) position. What CAN happen is that pulling
+    it out of its current spot steals overlap headroom some *other*
+    already-hidden collective was relying on -- which is exactly what the
+    net-effect search above guards against, by refusing to move past the
+    point where the total exposed time (target + everyone else) stops
+    improving.
+
+    Returns the refreshed (seq, positions, name_to_pos) if a beneficial move
+    happened, else None.
+    """
+    if blocker not in positions:
+        return None
+    cost = _profile_costs.get(blocker.name, 0.0)
+    if cost < _HEAVY_COMPUTE_MIN_US:
+        return None
+    floor, chain, _ = _earliest_legal_pos(blocker, positions, name_to_pos, comp_by_name)
+    blocker_pos = positions[blocker]
+    # blocker's own trivial chain gets inserted immediately before it, so
+    # its actual landing position is floor + len(chain), not floor itself.
+    # Comparing blocker_pos against the bare floor here would treat a
+    # blocker that's already perfectly packed right after its chain (no
+    # gap at all) as having "room to move", trigger a move that reinserts
+    # everything at the exact same final positions, and report success --
+    # which, since nothing about blocker_pos would actually change, makes
+    # every subsequent call see the same false "room to move" again,
+    # forever (bounded only by _MAX_PRODUCER_RELOCATE_HOPS).
+    final_pos = floor + len(chain)
+    if final_pos >= blocker_pos:
+        return None  # blocker itself already has nowhere earlier to go
+
+    best_pos, best_exposed = _find_best_blocker_position(
+        blocker, chain, floor, blocker_pos, ag_start, ag_done_pos, ag_latency,
+        start_of_done, positions, seq,
+    )
+    if best_pos >= blocker_pos:
+        return None  # no candidate position actually reduces total exposed time
+    current_total = _total_exposed_us(start_of_done, positions, seq)
+    if best_exposed >= current_total - 1e-6:
+        return None  # net loss or a wash -- not worth the churn
+
+    to_move_set = set(chain) | {blocker}
+    new_seq = [inst for inst in seq if inst not in to_move_set]
+    ins_pos = best_pos
+    for inst in chain:  # already in topological (schedule) order
+        new_seq.insert(ins_pos, inst)
+        ins_pos += 1
+    new_seq.insert(ins_pos, blocker)
+    schedule.set_sequence(comp, new_seq)
+    new_positions = {inst: i for i, inst in enumerate(new_seq)}
+    new_name_to_pos = {inst.name: i for inst, i in new_positions.items()}
+    return new_seq, new_positions, new_name_to_pos
 
 
 def _fill_exposed_collectives_with_heavy_compute(
@@ -646,7 +875,7 @@ def _fill_exposed_collectives_with_heavy_compute(
                 cost = _profile_costs.get(inst.name, 0.0)
                 if cost < _HEAVY_COMPUTE_MIN_US:
                     continue
-                floor, chain = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
+                floor, chain, _ = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
                 if floor > done_pos:
                     continue
                 candidate = inst
@@ -841,9 +1070,71 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
             # overlap headroom, and going as early as legally allowed also
             # puts the collective in front of any heavy compute (e.g. GEMMs)
             # that isn't an actual data/control dependency of its own.
-            floor, to_move = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
+            floor, to_move, blocker = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
+            orig_ag_start_pos = ag_start_pos  # for the "moved from X to Y" log below
 
-            if floor >= ag_start_pos:
+            # ag_start's own trivial operand chain is pinned by a real
+            # (non-trivial) producer at `floor - 1`. That producer's CURRENT
+            # position isn't necessarily where it has to be, though -- it
+            # may itself be a movable heavy op (e.g. a GEMM) sitting well
+            # after its own real dependencies, with a bunch of causally
+            # unrelated compute scheduled in between (e.g. other layers'
+            # forward/backward work) that just happened to land there. Chase
+            # the blocking producer's own blocking producer, and so on,
+            # walking the operand chain all the way back toward the
+            # computation's true inputs -- not only when ag_start is fully
+            # stuck (floor >= ag_start_pos), but always, since even a small
+            # legal move for ag_start today can mask a much larger one
+            # available by relocating its blocker first.
+            #
+            # Each hop does NOT unconditionally relocate the blocker all the
+            # way to its own theoretical-earliest floor: pulling a heavy op
+            # out of its current spot can just as easily EXPOSE some other,
+            # already-hidden collective that was relying on it sitting
+            # there for that collective's own overlap. Instead,
+            # _try_relocate_blocker_earlier searches every legal position
+            # between the blocker's current spot and its floor for the one
+            # that minimizes TOTAL exposed time summed across every
+            # collective in this computation (via
+            # _find_best_blocker_position / _total_exposed_us), and only
+            # moves it there if that's a net improvement -- possibly
+            # stopping well short of the theoretical floor, or not moving
+            # at all. Each hop re-derives this fresh against the latest
+            # positions, so the chain is walked and re-optimized
+            # recursively until no further net-beneficial move exists.
+            # Bounded by _MAX_PRODUCER_RELOCATE_HOPS purely as a safety net
+            # against pathological chains, not as a design ceiling --
+            # normal chains terminate on their own the moment no candidate
+            # position helps (or the blocker is too cheap to bother with),
+            # which _try_relocate_blocker_earlier reports by returning
+            # None.
+            hops = 0
+            while blocker is not None and hops < _MAX_PRODUCER_RELOCATE_HOPS:
+                result = _try_relocate_blocker_earlier(
+                    blocker, comp, schedule, seq, positions, name_to_pos, comp_by_name,
+                    ag_start, positions[ag_done], collective_latency, start_of_done,
+                )
+                if result is None:
+                    break
+                seq, positions, name_to_pos = result
+                changed = True
+                hops += 1
+                _logger.info(
+                    "collective_overlap_pass [%s]: relocated blocking producer %s "
+                    "earlier to unblock %s (hop %d).",
+                    module_name, blocker.name, ag_start.name, hops,
+                )
+                ag_start_pos = positions[ag_start]
+                floor, to_move, blocker = _earliest_legal_pos(
+                    ag_start, positions, name_to_pos, comp_by_name
+                )
+
+            # ag_start's own trivial chain lands immediately before it, so
+            # its actual post-move position is floor + len(to_move), not
+            # floor itself -- comparing against the bare floor would treat
+            # an already-optimally-packed ag_start (no gap between it and
+            # its chain) as movable and perform a no-op "move".
+            if floor + len(to_move) >= ag_start_pos:
                 _logger.debug(
                     "collective_overlap_pass [%s]: %s cannot move "
                     "(no legal earlier position, deficit=%.1f us).",
@@ -889,7 +1180,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                 "collective_overlap_pass: moving %s from pos %d to %d "
                 "with %d relocated operand(s) (overlap %.1f -> %.1f us, "
                 "latency=%.1f us).",
-                ag_start.name, ag_start_pos, new_ag_start_pos,
+                ag_start.name, orig_ag_start_pos, new_ag_start_pos,
                 len(to_move), current_overlap, new_overlap, collective_latency,
             )
 
