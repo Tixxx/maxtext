@@ -55,6 +55,7 @@ _PROTO_OUT_DIR = "/tmp/_collective_overlap_pass_proto"
 
 _PROTO_SOURCES = [
     "tsl/profiler/protobuf/profiled_instructions.proto",
+    "tsl/profiler/protobuf/xplane.proto",
     "xla/service/hlo.proto",
     "xla/xla_data.proto",
     "xla/service/metrics.proto",
@@ -122,8 +123,271 @@ def _update_profile(fdo_bytes: bytes) -> None:
                 "0 collectives; total pool now %d.",
                 len(costs), len(_profile_costs),
             )
+        _apply_te_ep_cost_overrides()
     except Exception as exc:  # pylint: disable=broad-except
         _logger.warning("collective_overlap_pass: failed to parse FDO profile: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# te_ep_* cost correction from a reference profiler trace
+# ---------------------------------------------------------------------------
+# PGLE's xplane->FDO conversion (xla/python/xplane_to_profile_instructions.cc,
+# ConvertXplaneToProfiledInstructionsProto) tags every individual GPU kernel
+# launch with its owning HLO instruction's name and stores cost_us as the MEAN
+# duration across all such launches. That's correct for an op that's one GPU
+# kernel. It's badly wrong for TE's expert-parallel dispatch/combine/prepare
+# custom-calls, each of which is actually *several* sequential GPU kernels
+# (e.g. te_ep_dispatch_ffi.N launches ~7: a couple of Memsets, a prob-density
+# conversion kernel, the NCCL dispatch kernel itself, another conversion
+# kernel, another Memset, and a local-permute kernel) all tagged with the same
+# HLO name -- PGLE averages across all of them (including several tiny ones),
+# producing a number close to the *per-kernel* mean rather than the *per-
+# invocation* total. Empirically confirmed on this workload: PGLE reports
+# ~459us for te_ep_dispatch_ffi.10 where the real, measured, single-invocation
+# wall-clock span (sum of its ~7 constituent kernels, since they run back-to-
+# back on the same stream) is ~3300us -- a ~7x underestimate. Every te_ep_*
+# family shows the same kind of underestimate (2x-22x depending on how many
+# tiny sub-kernels dilute the mean), so rather than trying to special-case
+# each family, this loads real per-invocation costs from a REFERENCE
+# profiler trace (a trace.json / trace.json.gz from any prior representative
+# run of this same workload, pointed to by COLLECTIVE_OVERLAP_REFERENCE_TRACE)
+# and overrides PGLE's te_ep_* entries with those instead.
+#
+# This has to be a *reference* trace rather than this run's own trace: the
+# pass runs during compilation, before this run's training steps (and hence
+# its own profiler capture) have happened. A two-pass workflow -- profile
+# once, then point subsequent runs at that trace -- mirrors how PGLE itself
+# already needs an initial profiling pass before it can recompile.
+_TE_EP_PREFIX = "te_ep"
+_INVOCATION_GAP_US = 100.0  # gap between GPU-stream events that starts a new invocation
+_te_ep_overrides: dict[str, float] = {}
+_te_ep_overrides_loaded = False
+
+
+def _load_te_ep_costs_from_trace(trace_path: str) -> dict[str, float]:
+    """Compute real per-invocation te_ep_* costs from a profiler trace.
+
+    Parses a Chrome-trace-format trace.json[.gz] (the same format the
+    xplane->trace.json.gz conversion produces, e.g. under
+    <run>/tensorboard/plugins/profile/<timestamp>/<host>.trace.json.gz),
+    filters to GPU:0's collective/NCCL stream, groups events by their hlo_op
+    tag, clusters consecutive events into invocations (a new invocation
+    starts whenever the gap since the previous event's end exceeds
+    _INVOCATION_GAP_US), sums each invocation's constituent kernel durations
+    (since they run back-to-back implementing one logical async op), and
+    averages those per-invocation sums across invocations. Returns
+    {hlo_op_name: avg_invocation_cost_us} for every te_ep_*-prefixed name
+    found.
+    """
+    import gzip  # pylint: disable=import-outside-toplevel
+    import json  # pylint: disable=import-outside-toplevel
+
+    try:
+        opener = gzip.open if trace_path.endswith(".gz") else open
+        with opener(trace_path, "rt") as f:
+            trace = json.load(f)
+    except Exception as exc:  # pylint: disable=broad-except
+        _logger.warning(
+            "collective_overlap_pass: failed to read reference trace %s: %s",
+            trace_path, exc,
+        )
+        return {}
+
+    by_op: dict[str, list[tuple[float, float]]] = {}
+    for event in trace.get("traceEvents", ()):
+        if event.get("ph") != "X" or event.get("pid") != 1 or event.get("tid") != 83:
+            continue
+        ts, dur = event.get("ts"), event.get("dur")
+        if ts is None or dur is None or dur <= 0:
+            continue
+        args = event.get("args") or {}
+        hlo_op = args.get("hlo_op") or args.get("long_name") or event.get("name", "")
+        if not hlo_op.startswith(_TE_EP_PREFIX):
+            continue
+        by_op.setdefault(hlo_op, []).append((ts, dur))
+
+    return _average_invocation_costs(by_op)
+
+
+def _average_invocation_costs(by_op: dict[str, list[tuple[float, float]]]) -> dict[str, float]:
+    """Given {hlo_op: [(ts_us, dur_us), ...]} GPU-stream events (in any
+    order), cluster each op's events into invocations (a new invocation
+    starts whenever the gap since the previous event's end within that op
+    exceeds _INVOCATION_GAP_US), sum each invocation's constituent event
+    durations (they run back-to-back implementing one logical async op),
+    and average those per-invocation sums across invocations. Returns
+    {hlo_op: avg_invocation_cost_us}."""
+    costs: dict[str, float] = {}
+    for hlo_op, events in by_op.items():
+        if not events:
+            continue
+        events.sort()
+        invocation_spans: list[float] = []
+        group_start, group_end = events[0][0], events[0][0] + events[0][1]
+        for ts, dur in events[1:]:
+            if ts - group_end > _INVOCATION_GAP_US:
+                invocation_spans.append(group_end - group_start)
+                group_start = ts
+            group_end = max(group_end, ts + dur)
+        invocation_spans.append(group_end - group_start)
+        costs[hlo_op] = sum(invocation_spans) / len(invocation_spans)
+    return costs
+
+
+def _load_te_ep_costs_from_xspace_bytes(xspace_bytes: bytes) -> dict[str, float]:
+    """Compute real per-invocation te_ep_* costs directly from a raw,
+    in-memory serialized XSpace protobuf (as returned by
+    ProfilerSession.stop(), the same bytes PGLE's own
+    ConvertXplaneToProfiledInstructionsProto consumes -- see
+    _patch_pgle_profiler).
+
+    This is the live, in-run counterpart to _load_te_ep_costs_from_trace:
+    instead of reading a previously-written trace.json.gz from some earlier
+    run, it parses PGLE's own profiling data for *this* run directly,
+    before it gets discarded, so the correction is available in time for
+    the recompile that immediately follows PGLE's profiling retries -- no
+    external reference trace or bootstrapping run required.
+
+    Walks XSpace -> XPlane (device planes only, name prefixed
+    "/device:GPU:") -> XLine -> XEvent, resolving each event's "hlo_op" stat
+    (checking both the event's own stats and its XEventMetadata's constant
+    stats, matching xplane_to_profile_instructions.cc's GetXPlaneLatencyInfo)
+    via either XStat.str_value directly or XStat.ref_value pointing at
+    another XStatMetadata's name (the interned-string form). Event
+    timestamps are computed as XLine.timestamp_ns*1000 + XEvent.offset_ps
+    (picoseconds since epoch); only the relative ordering/spacing within an
+    op matters here, so the absolute epoch offset is irrelevant.
+    """
+    _ensure_protos()
+    from tsl.profiler.protobuf import xplane_pb2 as _xp  # type: ignore  # pylint: disable=import-outside-toplevel
+
+    try:
+        xspace = _xp.XSpace()
+        xspace.ParseFromString(xspace_bytes)
+    except Exception as exc:  # pylint: disable=broad-except
+        _logger.warning(
+            "collective_overlap_pass: failed to parse live XSpace profile: %s", exc,
+        )
+        return {}
+
+    by_op: dict[str, list[tuple[float, float]]] = {}
+    for plane in xspace.planes:
+        if not plane.name.startswith("/device:GPU:"):
+            continue
+        stat_meta_name = {m.id: m.name for m in plane.stat_metadata.values()}
+        event_meta_stats = {
+            m.id: list(m.stats) for m in plane.event_metadata.values()
+        }
+
+        def _resolve_hlo_op(stats) -> Optional[str]:
+            for stat in stats:
+                if stat_meta_name.get(stat.metadata_id) != "hlo_op":
+                    continue
+                which = stat.WhichOneof("value")
+                if which == "str_value":
+                    return stat.str_value
+                if which == "ref_value":
+                    return stat_meta_name.get(stat.ref_value)
+            return None
+
+        for line in plane.lines:
+            for event in line.events:
+                if event.WhichOneof("data") != "offset_ps":
+                    continue
+                dur_us = event.duration_ps / 1e6
+                if dur_us <= 0:
+                    continue
+                hlo_op = (
+                    _resolve_hlo_op(event_meta_stats.get(event.metadata_id, ()))
+                    or _resolve_hlo_op(event.stats)
+                )
+                if not hlo_op or not hlo_op.startswith(_TE_EP_PREFIX):
+                    continue
+                ts_us = (line.timestamp_ns * 1000 + event.offset_ps) / 1e6
+                by_op.setdefault(hlo_op, []).append((ts_us, dur_us))
+
+    return _average_invocation_costs(by_op)
+
+
+def _resolve_reference_trace_path(spec: str) -> Optional[str]:
+    """Resolve COLLECTIVE_OVERLAP_REFERENCE_TRACE to an actual trace file.
+
+    The trace's own path is never stable across runs -- it's nested under
+    per-run output dirs keyed by job ID/timestamp and a per-host subdir keyed
+    by hostname/capture-timestamp (e.g.
+    <output_dir>/<output_dir>/tensorboard/plugins/profile/<ts>/<host>.trace.json.gz).
+    Requiring an exact path would mean updating this env var by hand every
+    run. Instead, `spec` may be:
+      - an exact file: used as-is.
+      - a directory: searched recursively for *.trace.json.gz.
+      - a glob pattern (containing * or ?): expanded directly, e.g.
+        ".../outputs/*/*/tensorboard/plugins/profile/*/*.trace.json.gz".
+    Whenever more than one file matches, the most recently modified one wins
+    -- so pointing this at a stable parent directory (or even the whole
+    shared outputs/ root) and just leaving it there works across runs
+    without any manual upkeep, as long as it's updated by copying/symlinking
+    a known-good run's trace there once you have one you trust.
+    """
+    import glob  # pylint: disable=import-outside-toplevel
+
+    if os.path.isfile(spec):
+        return spec
+    pattern = spec if any(c in spec for c in "*?[") else os.path.join(spec, "**", "*.trace.json.gz")
+    matches = glob.glob(pattern, recursive=True)
+    if not matches:
+        _logger.warning(
+            "collective_overlap_pass: COLLECTIVE_OVERLAP_REFERENCE_TRACE=%s "
+            "matched no trace files.", spec,
+        )
+        return None
+    return max(matches, key=os.path.getmtime)
+
+
+def _apply_te_ep_cost_overrides() -> None:
+    """Override PGLE's te_ep_* entries in _profile_costs with corrected
+    per-invocation costs loaded once from COLLECTIVE_OVERLAP_REFERENCE_TRACE.
+
+    If that env var isn't set, falls back to searching $WORKSPACE_DIR/outputs
+    -- the maxtext-launcher submit script always exports WORKSPACE_DIR
+    (submit.template.sh: --export=ALL,WORKSPACE_DIR=$WORKSPACE_DIR), and
+    every run's trace lands somewhere under
+    $WORKSPACE_DIR/outputs/<run>/<run>/tensorboard/plugins/profile/<ts>/, so
+    this works out of the box with zero config -- it just picks up whatever
+    the most recently modified trace anywhere in outputs/ happens to be. Set
+    COLLECTIVE_OVERLAP_REFERENCE_TRACE explicitly to pin a specific, curated
+    trace instead of trusting "most recent" (e.g. if the latest run in
+    outputs/ was a broken or otherwise unrepresentative one).
+
+    No-op (and cheap to call repeatedly) once loaded or if neither is set.
+    """
+    global _te_ep_overrides_loaded
+    if _te_ep_overrides_loaded:
+        if _te_ep_overrides:
+            _profile_costs.update(_te_ep_overrides)
+        return
+    _te_ep_overrides_loaded = True
+    spec = os.environ.get("COLLECTIVE_OVERLAP_REFERENCE_TRACE")
+    if not spec:
+        workspace_dir = os.environ.get("WORKSPACE_DIR")
+        if not workspace_dir:
+            return
+        spec = os.path.join(workspace_dir, "outputs")
+    trace_path = _resolve_reference_trace_path(spec)
+    if trace_path is None:
+        return
+    _te_ep_overrides.update(_load_te_ep_costs_from_trace(trace_path))
+    if _te_ep_overrides:
+        _profile_costs.update(_te_ep_overrides)
+        _logger.info(
+            "collective_overlap_pass: loaded %d te_ep_* cost corrections from "
+            "reference trace %s (resolved from %s).",
+            len(_te_ep_overrides), trace_path, spec,
+        )
+    else:
+        _logger.warning(
+            "collective_overlap_pass: reference trace %s (resolved from %s) "
+            "had no te_ep_* entries.", trace_path, spec,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +520,22 @@ _SPLIT_DEFICIT_THRESHOLD_US = (
     float("inf") if os.environ.get("COLLECTIVE_OVERLAP_DISABLE_SPLIT") == "1"
     else 500.0
 )
+# Instruction-name prefixes _phase2_split_core actually knows how to split:
+# a plain batched collective custom-call with multiple tuple operands
+# directly on the async-start. Other async-start-wrapped ops (e.g.
+# call-start wrapping a te_ep collective) don't have a directly-splittable
+# operand list in the shape _phase2_split_core expects -- it just logs "no
+# inner collective" and produces nothing for them, so there's no point
+# queuing them as split candidates in the first place.
+#
+# Matched against ag_start.name (not .opcode): all-gather/reduce-scatter/
+# all-reduce-start are lowered as a generic async-start wrapper at the HLO
+# opcode level (inst.opcode.name comes back as "async-start" for all of
+# them, same as a te_ep call-start) -- only the instruction's *name* (its
+# scheduling_name, e.g. "all-gather-start.8") actually distinguishes which
+# kind of collective it is. Same pattern as _FSDP_COLLECTIVE_PREFIXES below.
+_SPLITTABLE_NAME_PREFIXES = ("all-gather-start", "reduce-scatter-start", "all-reduce-start")
+
 # Minimum number of operand groups to split.
 _SPLIT_MIN_GROUPS = 2
 # Typical number of operands per "layer epoch" in a batched collective.
@@ -273,6 +553,13 @@ class _SplitCandidate:
     # effective_producer_pos[i] = schedule position of the 'real' producer
     # (tracing through bitcasts/GTEs) for operand i of the async-start.
     effective_producer_pos: list[int] = field(default_factory=list)
+    # PGLE-measured latency of the *original*, pre-split collective. Used by
+    # _phase2_split_core to estimate each new sub-collective's own latency
+    # (proportional to its share of total operand bytes) -- the new
+    # sub-collectives have no PGLE profile entry of their own (they didn't
+    # exist when profiling ran), so without this they'd be silently skipped
+    # by the post-split _phase1_reorder re-run (see _run_phase1_to_fixed_point).
+    total_latency_us: float = 0.0
 
 
 def _is_async_start(inst: object) -> bool:
@@ -297,6 +584,29 @@ def _is_async_start(inst: object) -> bool:
     instruction calls). The outer async-start is what appears in the
     schedule this function walks, and it's already covered by the
     "async-start" opcode check above.
+
+    A generic "async-start" opcode is not exclusively a network collective:
+    with use_generic_async_start_done, XLA routes essentially everything
+    async through this one opcode -- standard NCCL collectives (whether
+    printed as "all-gather-start"/"reduce-scatter-start"/etc. with direct
+    operands and a collective_backend_config, or as generic "async-start
+    ... calls=%async_computation.N"), TE's expert-parallel dispatch/combine
+    ops (wrapped via to_apply=%name, tagged
+    frontend_attributes={_xla_stream_annotation="collective"} -- see
+    _resolve_profile_key), and even
+    apparently-unrelated async "call" wrappers with a trivial passthrough
+    body that carry no meaningful cost. All of these genuinely share the
+    same opcode value, not just similar printed keywords (verified: a
+    reduce-scatter-start printed with direct operands and no calls= still
+    satisfies this check, and previously an attempt to require calls=/the
+    stream annotation here to exclude the trivial-passthrough case instead
+    silently broke detection for that direct-operand collective form --
+    there is no cheap, reliable way to distinguish "trivial passthrough
+    call" from "genuine collective" by opcode/attributes alone, so this
+    deliberately stays permissive: being async at all is enough to know
+    phase 1 should consider scheduling it, and a trivial-cost wrapper is
+    harmless here since it will simply never show a deficit worth acting
+    on).
     """
     opcode = _opcode_str(inst)
     return opcode in _ASYNC_START_OPCODES or opcode == "async-start"
@@ -428,13 +738,29 @@ def _proto_effective_pos(
 # ---------------------------------------------------------------------------
 _TRIVIAL_SINGLE_OPCODES = frozenset({
     "bitcast", "convert", "transpose", "reshape", "broadcast",
-    "get-tuple-element", "tuple", "copy",
+    "get-tuple-element", "tuple", "copy", "slice",
+    # "parameter"/"constant" are leaves with no real data dependency (a
+    # parameter is available from the start of the computation; a constant
+    # is a compile-time literal) -- they were missing here even though
+    # _TRIVIAL_FUSED_OPCODES already treats them as trivial inside a fusion
+    # body. Without this, _earliest_legal_pos's chain walk treated wherever
+    # a param/constant happened to already be scheduled as a genuine
+    # "non-trivial blocker" pinning a candidate's floor -- and
+    # _try_relocate_blocker_earlier then refused to relocate it anyway,
+    # since its resolved cost is 0us (below _HEAVY_COMPUTE_MIN_US), a gate
+    # meant to skip cheap *fill candidates*, not to protect something that
+    # should always be freely movable. Confirmed via the TRC/CHC diagnostic
+    # logging on job 3174209: "cost < _HEAVY_COMPUTE_MIN_US" blocked by
+    # param/constant was the single largest refusal reason (thousands of
+    # hits) for why all-gather-start.8.g3's chase never got anywhere near
+    # te_gemm_v2_ffi.81/.87 or dot_product_attention_fwd.10.
+    "parameter", "constant",
 })
 
 _TRIVIAL_FUSED_OPCODES = frozenset({
     "parameter", "constant", "iota",
     "convert", "bitcast", "reshape", "transpose", "broadcast", "copy",
-    "concatenate", "dynamic-slice",
+    "concatenate", "dynamic-slice", "slice",
     "get-tuple-element", "tuple",
     "add", "subtract", "multiply", "divide", "negate", "abs",
     "maximum", "minimum", "and", "or", "not", "xor",
@@ -504,12 +830,189 @@ def _control_predecessor_names(inst) -> list[str]:
     return [n.strip().lstrip("%") for n in m.group(1).split(",") if n.strip()]
 
 
+_TO_APPLY_RE = re.compile(r"to_apply=%([A-Za-z0-9_.]+)")
+_ROOT_RE = re.compile(r"\bROOT %([A-Za-z0-9_.\-]+) = ")
+
+
+def _computation_root(comp):
+    """Find comp's ROOT instruction, via comp.root_instruction().
+
+    Falls back to parsing comp.to_string()'s "ROOT %name = ..." marker (the
+    same signal XLA's own printer uses) and then to "the one instruction
+    with no in-computation users" only if root_instruction() itself isn't
+    available for some reason -- that last heuristic is unreliable in
+    general (an unused parameter also has no users, and can be mispicked
+    instead of the real root) but better than nothing.
+    """
+    try:
+        return comp.root_instruction()
+    except Exception:
+        pass
+    try:
+        text = comp.to_string()
+        m = _ROOT_RE.search(text)
+        if m:
+            root_name = m.group(1)
+            for inst in comp.instructions():
+                if inst.name == root_name:
+                    return inst
+    except Exception:
+        pass
+    try:
+        for inst in comp.instructions():
+            if not list(inst.users()):
+                return inst
+    except Exception:
+        pass
+    return None
+
+
+_MAX_PROFILE_KEY_UNWRAP_HOPS = 8
+
+
+def _unwrap_to_leaf_name(inst, comp_by_name: dict) -> str:
+    """Follow nested call/async wrappers down to the instruction PGLE
+    actually profiles.
+
+    Per the observed structure of TE's expert-parallel dispatch/combine
+    wrapping: an async-start whose own computation's root is a plain "call"
+    (kCall, synchronous, not async) needs one more hop through *that* call's
+    own to_apply= computation -- its root is the profiled instruction. A
+    get-tuple-element (or any other non-call/async op) reached at any point
+    is treated as a legitimate stopping point, not something to unwrap
+    further: it may simply have no profile entry (a trivial passthrough,
+    same as we already tolerate for standard collectives), which is fine --
+    we don't force our way past it. Bounded by _MAX_PROFILE_KEY_UNWRAP_HOPS
+    purely as a safety net against unexpectedly deep or cyclic call chains.
+    """
+    for hop in range(_MAX_PROFILE_KEY_UNWRAP_HOPS):
+        opc = _opcode_str(inst)
+        _logger.debug(
+            "collective_overlap_pass: _unwrap_to_leaf_name hop %d: %s(%s).",
+            hop, inst.name, opc,
+        )
+        if opc not in ("call", "call-start", "async-start"):
+            return inst.name
+        try:
+            text = inst.to_string()
+        except Exception:
+            return inst.name
+        m = _TO_APPLY_RE.search(text) or _CALLS_RE.search(text)
+        if not m:
+            return inst.name
+        comp = comp_by_name.get(m.group(1))
+        if comp is None:
+            return inst.name
+        root = _computation_root(comp)
+        if root is None:
+            return inst.name
+        inst = root
+    return inst.name
+
+
+def _resolve_profile_key(ag_start, comp_by_name: dict) -> str:
+    """Best-effort name to look up ag_start's measured latency under in
+    _profile_costs.
+
+    Standard collectives (all-gather-start etc, opcode async-start wrapping
+    calls=%async_computation.N) expose their wrapped root directly via
+    async_wrapped_root(), and PGLE keys their cost under that root
+    instruction's name.
+
+    TE's expert-parallel dispatch/combine ops are wrapped differently:
+    opcode async-start too, but via to_apply=%name (a plain HLO call, not
+    the calls=%async_computation.N convention) and tagged with
+    frontend_attributes={_xla_stream_annotation="collective"} (XLA's own
+    marker for "scheduled on the collective stream"). async_wrapped_root()
+    doesn't understand the to_apply= convention and raises for those, so we
+    fall back to parsing to_apply=%name ourselves and finding that
+    computation's ROOT via _computation_root.
+
+    Either way, the root found (whether via async_wrapped_root() or the
+    to_apply= fallback) is NOT assumed to already be the final leaf: it is
+    always passed through _unwrap_to_leaf_name, which additionally chases
+    it further if it's itself another call/async wrapper rather than the
+    real kernel. This matters because async_wrapped_root() can genuinely
+    succeed yet still return an intermediate wrapper (verified empirically:
+    for te_ep's call-start instructions it reliably resolved to a plain
+    "call.N" instruction, one hop short of the real te_ep_dispatch_ffi.N/
+    te_ep_combine_ffi.N leaf) -- returning on its first success without
+    unwrapping further silently skipped all of the fallback logic below.
+    """
+    root = None
+    try:
+        root = ag_start.async_wrapped_root()
+    except Exception:
+        root = None
+    if root is None:
+        try:
+            text = ag_start.to_string()
+        except Exception:
+            text = ""
+        m = _TO_APPLY_RE.search(text)
+        if m:
+            comp = comp_by_name.get(m.group(1))
+            if comp is not None:
+                root = _computation_root(comp)
+    if root is None:
+        return ag_start.name
+    return _unwrap_to_leaf_name(root, comp_by_name)
+
+
 _MAX_RELOCATE_CHAIN = 64
 
 # Minimum profiled cost (us) for a non-trivial instruction to be considered
 # a "heavy compute" worth relocating into an exposed collective's window --
 # below this it's not worth the bookkeeping/relocation churn.
 _HEAVY_COMPUTE_MIN_US = 5.0
+
+_TE_GEMM_TARGET_RE = re.compile(r'custom_call_target="(te_grouped_gemm[^"]*|te_gemm[^"]*)"')
+
+
+def _is_te_gemm_custom_call(inst, comp_by_name: dict) -> bool:
+    """True if inst is a custom-call to a MoE GEMM kernel (custom_call_target
+    prefixed te_grouped_gemm or te_gemm, e.g. te_grouped_gemm_v2_ffi.N or
+    te_gemm_v2_ffi.N), OR a kind=kCustom fusion (e.g. a dynamic-slice-fusion)
+    whose single nested computation directly wraps one -- the same wrapper
+    case _resolve_inst_cost corrects for when summing costs, since a
+    kCustom fusion's own name never gets a PGLE entry (the real kernel
+    launch is tagged with the inner custom-call's name instead). Without
+    this, a te_gemm wrapped in a dynamic-slice-fusion would get the right
+    cost (via _resolve_inst_cost) but never win priority here, since its
+    own opcode is "fusion", not "custom-call".
+
+    These dominate compute time in DeepSeek-family MoE models, so when
+    filling an exposed FSDP-style all-gather/reduce-scatter collective's
+    window (see _fill_exposed_collectives_with_heavy_compute), they're
+    prioritized over other legal heavy-compute candidates.
+    """
+    opc = _opcode_str(inst)
+    try:
+        text = inst.to_string()
+    except Exception:
+        return False
+    if opc == "custom-call":
+        return bool(_TE_GEMM_TARGET_RE.search(text))
+    if opc == "fusion" and "kind=kCustom" in text:
+        m = _CALLS_RE.search(text)
+        if not m:
+            return False
+        comp = comp_by_name.get(m.group(1))
+        if comp is None:
+            return False
+        try:
+            for sub in comp.instructions():
+                if _opcode_str(sub) != "custom-call":
+                    continue
+                if _TE_GEMM_TARGET_RE.search(sub.to_string()):
+                    return True
+        except Exception:
+            return False
+        return False
+    return False
+
+
+_FSDP_COLLECTIVE_PREFIXES = ("all-gather", "reduce-scatter")
 
 
 def _earliest_legal_pos(
@@ -592,34 +1095,113 @@ def _earliest_legal_pos(
 # or buggy chain that never terminates; it should not normally be reached.
 _MAX_PRODUCER_RELOCATE_HOPS = 64
 
+# Disabled for now: measured net-negative on the DeepSeek-small validation
+# workload even after fixing the landing-position off-by-len(chain) bug in
+# _find_best_blocker_position (job 3150632: 36.25% collective/compute
+# overlap, worse than both baseline (37.85%) and the simpler non-recursive
+# fix (39.34%) that only does the direction-(a) chain-relocation fix plus
+# _fill_exposed_collectives_with_heavy_compute). Root cause is believed to
+# be that _find_best_blocker_position's net-benefit check is a per-hop,
+# per-target-collective approximation -- it doesn't account for a later hop
+# (chasing a *different* collective's blocker) undoing the assumptions an
+# earlier hop's "net win" was computed under, so a sequence of individually
+# net-positive-looking moves can still add up to a net-negative schedule.
+# Re-enable only after that approximation is tightened.
+_ENABLE_RECURSIVE_BLOCKER_CHASE = False
 
-def _prefix_costs_excluding(seq: list, exclude: set) -> list:
+# Bound on how many times _fill_exposed_collectives_with_heavy_compute will
+# chase "the blocker's own blocker" earlier for a single fill candidate that
+# isn't yet legally reachable (e.g. dot_product_attention_fwd blocked by a
+# GEMM that's itself blocked by another GEMM). Unlike
+# _ENABLE_RECURSIVE_BLOCKER_CHASE (which chases a *collective's own* blocker
+# recursively and was found net-negative -- see above), this chases a *fill
+# candidate's* blocker via _try_relocate_blocker_earlier, whose net-benefit
+# gate (_find_best_blocker_position / _total_exposed_us) already re-checks
+# total exposed time across the whole computation before committing each
+# hop -- so each hop is individually gated, though the same class of
+# cross-hop interaction _ENABLE_RECURSIVE_BLOCKER_CHASE's comment warns
+# about could in principle still apply here. Set
+# COLLECTIVE_OVERLAP_HEAVY_CHASE_HOPS=0 to disable.
+_MAX_HEAVY_COMPUTE_CHASE_HOPS = int(
+    os.environ.get("COLLECTIVE_OVERLAP_HEAVY_CHASE_HOPS", "8")
+)
+
+
+def _resolve_inst_cost(inst, comp_by_name: dict) -> float:
+    """Profiled cost (us) for inst, correcting for kind=kCustom fusions
+    (e.g. a dynamic-slice-fusion) whose PGLE cost is attributed to the real
+    instruction(s) inside their single nested computation rather than to
+    the outer fusion wrapper.
+
+    Example: a dynamic-slice-fusion wrapping a real kernel like
+    te_gemm_v2_ffi.N alongside a dynamic-update-slice that writes its
+    result into a loop-carried buffer -- PGLE tags each inner GPU kernel
+    launch with its own hlo_op, so _profile_costs has entries under
+    "te_gemm_v2_ffi.N" (and "dynamic-update-slice.N" too, if it has a
+    measurable cost of its own) but never under the fusion's own name, so a
+    plain _profile_costs.get(inst.name, 0.0) silently sees 0 for the whole
+    fusion.
+
+    Unlike the call/call-start chain (_unwrap_to_leaf_name), a kCustom
+    fusion's body can hold MULTIPLE real, independently-costed ops rather
+    than a single terminal leaf -- its ROOT is often just a trivial `tuple`
+    combining them (e.g. ROOT %tuple.81 = tuple(%dynamic-update-slice.145,
+    %te_gemm_v2_ffi.354#1)) -- so the correct fix is to SUM every
+    instruction in the body that has its own profile entry, not to resolve
+    down to "the" leaf.
+
+    Falls back to the plain inst.name lookup (0.0 if absent) whenever inst
+    isn't a kCustom fusion, or its body sums to 0 anyway.
+    """
+    direct = _profile_costs.get(inst.name)
+    if direct:
+        return direct
+    if _opcode_str(inst) != "fusion":
+        return 0.0
+    try:
+        text = inst.to_string()
+    except Exception:
+        return 0.0
+    if "kind=kCustom" not in text:
+        return 0.0
+    m = _CALLS_RE.search(text)
+    if not m:
+        return 0.0
+    comp = comp_by_name.get(m.group(1))
+    if comp is None:
+        return 0.0
+    try:
+        return sum(_profile_costs.get(sub.name, 0.0) for sub in comp.instructions())
+    except Exception:
+        return 0.0
+
+
+def _prefix_costs_excluding(seq: list, exclude: set, comp_by_name: dict) -> list:
     """Prefix sum of profile costs along `seq`, with instructions in
     `exclude` contributing 0 -- lets overlap for a hypothetical position be
     computed without those instructions' cost being double-counted at both
     their old and a candidate new position."""
     prefix = [0.0] * (len(seq) + 1)
     for i, inst in enumerate(seq):
-        c = 0.0 if inst in exclude else _profile_costs.get(inst.name, 0.0)
+        c = 0.0 if inst in exclude else _resolve_inst_cost(inst, comp_by_name)
         prefix[i + 1] = prefix[i] + c
     return prefix
 
 
-def _total_exposed_us(start_of_done: dict, positions: dict, seq: list) -> float:
+def _total_exposed_us(
+    start_of_done: dict, positions: dict, seq: list, comp_by_name: dict,
+) -> float:
     """Sum of positive deficits (exposed/un-hidden latency) across every
     collective in `start_of_done` with a known profile cost, using the
     schedule exactly as it stands -- the ground-truth "how much is exposed
     right now, everywhere" metric used to decide whether a candidate
     relocation is a net win or a net loss."""
-    prefix = _prefix_costs_excluding(seq, ())
+    prefix = _prefix_costs_excluding(seq, (), comp_by_name)
     total = 0.0
     for ag_done, ag_start in start_of_done.items():
         if ag_start not in positions or ag_done not in positions:
             continue
-        try:
-            profile_key = ag_start.async_wrapped_root().name
-        except Exception:
-            profile_key = ag_start.name
+        profile_key = _resolve_profile_key(ag_start, comp_by_name)
         latency = _profile_costs.get(profile_key)
         if latency is None or latency <= 0:
             continue
@@ -640,6 +1222,7 @@ def _find_best_blocker_position(
     start_of_done: dict,
     positions: dict,
     seq: list,
+    comp_by_name: dict,
 ) -> tuple[int, float]:
     """Search positions in [floor, blocker_pos] for the one that minimizes
     TOTAL exposed time summed across every collective in this computation --
@@ -666,21 +1249,20 @@ def _find_best_blocker_position(
     relocating a heavy op out of a stretch of the schedule that other,
     already-hidden collectives were relying on for their own overlap.
 
-    Returns (best_pos, best_total_exposed_us). best_pos == blocker_pos
-    means no earlier position actually reduces total exposed time, i.e.
-    don't move blocker at all.
+    Returns (best_pos, best_total_exposed_us) where best_pos is the chain's
+    insertion start -- blocker itself lands at best_pos + len(chain), same
+    convention as _earliest_legal_pos/_phase1_reorder use elsewhere.
+    best_pos == blocker_pos - len(chain) means no candidate landing position
+    actually reduces total exposed time, i.e. don't move blocker at all.
     """
-    prefix = _prefix_costs_excluding(seq, set(chain) | {blocker})
-    block_cost = _profile_costs.get(blocker.name, 0.0)
+    prefix = _prefix_costs_excluding(seq, set(chain) | {blocker}, comp_by_name)
+    block_cost = _resolve_inst_cost(blocker, comp_by_name)
 
     other_windows = []  # (start_pos, done_pos, latency, base_overlap_excl_block)
     for od, os in start_of_done.items():
         if os is ag_start or os not in positions or od not in positions:
             continue
-        try:
-            profile_key = os.async_wrapped_root().name
-        except Exception:
-            profile_key = os.name
+        profile_key = _resolve_profile_key(os, comp_by_name)
         latency2 = _profile_costs.get(profile_key)
         if latency2 is None or latency2 <= 0:
             continue
@@ -688,19 +1270,28 @@ def _find_best_blocker_position(
         base_overlap = prefix[d2] - prefix[s2 + 1] if d2 > s2 + 1 else 0.0
         other_windows.append((s2, d2, latency2, base_overlap))
 
-    # Only positions where some window's containment of blocker could
-    # actually flip are worth evaluating -- the floor, the original spot,
-    # and every other collective's start/done boundary in between.
-    candidates = {floor, blocker_pos}
+    # Search directly over blocker's *landing* position, not the chain's
+    # insertion start -- that way "leave blocker where it is" is
+    # unambiguously new_pos == blocker_pos, with no implicit dependence on
+    # len(chain). (Evaluating candidates in insertion-start units instead,
+    # as an earlier version of this function did, made the "no-op" baseline
+    # silently equal to blocker_pos + len(chain) -- a real, later position
+    # -- any time the chain was non-empty, which corrupted the net-benefit
+    # comparison against the true current state and could make relocating
+    # back and forth between two blockers each look like a net win in
+    # sequence, i.e. a non-terminating oscillation.) The insertion-start P
+    # actually used to splice the schedule is derived from the winning
+    # landing position by subtracting len(chain) exactly once, at the end.
+    lo = floor + len(chain)
+    new_pos_candidates = {lo, blocker_pos}
     for s2, d2, _, _ in other_windows:
-        if floor <= s2 < blocker_pos:
-            candidates.add(s2 + 1)
-        if floor < d2 <= blocker_pos:
-            candidates.add(d2)
-    candidates = sorted(p for p in candidates if floor <= p <= blocker_pos)
+        if lo <= s2 < blocker_pos:
+            new_pos_candidates.add(s2 + 1)
+        if lo < d2 <= blocker_pos:
+            new_pos_candidates.add(d2)
+    new_pos_candidates = sorted(p for p in new_pos_candidates if lo <= p <= blocker_pos)
 
-    def total_exposed(P: int) -> float:
-        blocker_new_pos = P + len(chain)
+    def total_exposed(blocker_new_pos: int) -> float:
         ag_new_start = blocker_new_pos + 1
         ag_overlap = (
             prefix[ag_done_pos] - prefix[ag_new_start] if ag_done_pos > ag_new_start else 0.0
@@ -712,18 +1303,18 @@ def _find_best_blocker_position(
             total += max(0.0, latency2 - overlap2)
         return total
 
-    best_pos, best_exposed = blocker_pos, None
-    for P in candidates:
-        e = total_exposed(P)
+    best_new_pos, best_exposed = blocker_pos, None
+    for new_pos in new_pos_candidates:
+        e = total_exposed(new_pos)
         # Prefer strictly lower total exposed time; on a tie, prefer the
         # position closest to blocker_pos (the least disruptive change that
         # achieves the same result).
         if best_exposed is None or e < best_exposed - 1e-6 or (
-            abs(e - best_exposed) <= 1e-6 and P > best_pos
+            abs(e - best_exposed) <= 1e-6 and new_pos > best_new_pos
         ):
             best_exposed = e
-            best_pos = P
-    return best_pos, best_exposed
+            best_new_pos = new_pos
+    return best_new_pos - len(chain), best_exposed
 
 
 def _try_relocate_blocker_earlier(
@@ -738,6 +1329,7 @@ def _try_relocate_blocker_earlier(
     ag_done_pos: int,
     ag_latency: float,
     start_of_done: dict,
+    module_name: str = "",
 ):
     """If `blocker` -- a non-trivial instruction pinning some collective's
     floor -- is itself a movable heavy op, relocate it (and its own trivial
@@ -760,9 +1352,19 @@ def _try_relocate_blocker_earlier(
     happened, else None.
     """
     if blocker not in positions:
+        _logger.debug(
+            "collective_overlap_pass [%s]: TRC %s: blocker not in positions "
+            "(already relocated/removed this round?), refusing.",
+            module_name, blocker.name,
+        )
         return None
-    cost = _profile_costs.get(blocker.name, 0.0)
+    cost = _resolve_inst_cost(blocker, comp_by_name)
     if cost < _HEAVY_COMPUTE_MIN_US:
+        _logger.debug(
+            "collective_overlap_pass [%s]: TRC %s: cost=%.1f us < "
+            "_HEAVY_COMPUTE_MIN_US=%.1f us, refusing to chase.",
+            module_name, blocker.name, cost, _HEAVY_COMPUTE_MIN_US,
+        )
         return None
     floor, chain, _ = _earliest_legal_pos(blocker, positions, name_to_pos, comp_by_name)
     blocker_pos = positions[blocker]
@@ -777,18 +1379,46 @@ def _try_relocate_blocker_earlier(
     # forever (bounded only by _MAX_PRODUCER_RELOCATE_HOPS).
     final_pos = floor + len(chain)
     if final_pos >= blocker_pos:
+        _logger.debug(
+            "collective_overlap_pass [%s]: TRC %s: no room to move "
+            "(own floor=%d + chain=%d = %d >= current pos=%d).",
+            module_name, blocker.name, floor, len(chain), final_pos, blocker_pos,
+        )
         return None  # blocker itself already has nowhere earlier to go
 
     best_pos, best_exposed = _find_best_blocker_position(
         blocker, chain, floor, blocker_pos, ag_start, ag_done_pos, ag_latency,
-        start_of_done, positions, seq,
+        start_of_done, positions, seq, comp_by_name,
     )
-    if best_pos >= blocker_pos:
+    # best_pos is an insertion-start position; blocker_pos - len(chain) is
+    # the insertion-start that reproduces "leave blocker exactly where it
+    # is" (blocker_pos itself is a landing position, not an insertion
+    # start -- see _find_best_blocker_position's docstring).
+    if best_pos >= blocker_pos - len(chain):
+        _logger.debug(
+            "collective_overlap_pass [%s]: TRC %s: own floor=%d is legal "
+            "(pos %d, room to move to %d), but no candidate landing "
+            "position in [floor, current] reduces total exposed time "
+            "(best_exposed=%.1f us) -- refusing.",
+            module_name, blocker.name, floor, blocker_pos, final_pos, best_exposed,
+        )
         return None  # no candidate position actually reduces total exposed time
-    current_total = _total_exposed_us(start_of_done, positions, seq)
+    current_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
     if best_exposed >= current_total - 1e-6:
+        _logger.debug(
+            "collective_overlap_pass [%s]: TRC %s: best candidate position "
+            "%d exposes %.1f us total >= current %.1f us -- net loss/wash, "
+            "refusing.",
+            module_name, blocker.name, best_pos, best_exposed, current_total,
+        )
         return None  # net loss or a wash -- not worth the churn
 
+    _logger.debug(
+        "collective_overlap_pass [%s]: TRC %s: relocating from pos %d to "
+        "%d (chain len %d) -- total exposed %.1f -> %.1f us.",
+        module_name, blocker.name, blocker_pos, best_pos + len(chain), len(chain),
+        current_total, best_exposed,
+    )
     to_move_set = set(chain) | {blocker}
     new_seq = [inst for inst in seq if inst not in to_move_set]
     ins_pos = best_pos
@@ -800,6 +1430,202 @@ def _try_relocate_blocker_earlier(
     new_positions = {inst: i for i, inst in enumerate(new_seq)}
     new_name_to_pos = {inst.name: i for inst, i in new_positions.items()}
     return new_seq, new_positions, new_name_to_pos
+
+
+def _chase_exposed_collective_blocker_earlier(
+    blocker_done,
+    start_of_done: dict,
+    exposed_dones: set,
+    window_start_pos: int,
+    window_done_pos: int,
+    seq: list,
+    schedule,
+    comp,
+    positions: dict,
+    name_to_pos: dict,
+    comp_by_name: dict,
+):
+    """If `blocker_done` is the done-side of ANOTHER still-exposed collective
+    (its own window still has unhidden deficit -- see `exposed_dones`), try
+    to relocate that collective's own start earlier so it sits between the
+    caller's window and whatever heavy-compute candidate it's currently
+    blocking, instead of leaving that candidate permanently disqualified.
+
+    Unlike _try_relocate_blocker_earlier (which chases an arbitrary heavy op
+    blocking a collective, and was found net-negative in its general form --
+    see _ENABLE_RECURSIVE_BLOCKER_CHASE), this only fires for the narrow,
+    concrete case the caller has already identified: a real data dependency
+    on another exposed collective's done sitting between this window and a
+    candidate that would otherwise fill it. Relocating that collective's
+    start closer to the caller's window can only help both: it gets a
+    chance at overlap from the caller's window, and the candidate's own
+    floor (pinned by that done) moves earlier too.
+
+    The move is capped at `window_done_pos` -- it never lands past the end
+    of the caller's own window -- and bounded by the chased collective's own
+    legal floor, so it never violates its own dependencies.
+
+    Returns (changed, seq, positions, name_to_pos); the seq/positions/
+    name_to_pos are the original objects, unchanged, if no move was made.
+    """
+    if blocker_done not in exposed_dones:
+        return False, seq, positions, name_to_pos
+    chase_start = start_of_done.get(blocker_done)
+    if chase_start is None or chase_start not in positions:
+        return False, seq, positions, name_to_pos
+    chase_start_pos = positions[chase_start]
+    if chase_start_pos <= window_start_pos:
+        # Already at or before our window -- nothing to gain by chasing it.
+        return False, seq, positions, name_to_pos
+    chase_floor, chase_chain, _ = _earliest_legal_pos(
+        chase_start, positions, name_to_pos, comp_by_name
+    )
+    target = max(chase_floor, window_start_pos + 1)
+    target = min(target, window_done_pos)
+    if target + len(chase_chain) >= chase_start_pos:
+        # No real room to move it earlier than where it already sits.
+        return False, seq, positions, name_to_pos
+
+    to_move_set = set(chase_chain) | {chase_start}
+    new_seq = [inst for inst in seq if inst not in to_move_set]
+    ins_pos = target
+    for inst in chase_chain:  # already in topological (schedule) order
+        new_seq.insert(ins_pos, inst)
+        ins_pos += 1
+    new_seq.insert(ins_pos, chase_start)
+    schedule.set_sequence(comp, new_seq)
+    new_positions = {inst: i for i, inst in enumerate(new_seq)}
+    new_name_to_pos = {inst.name: i for inst, i in new_positions.items()}
+    return True, new_seq, new_positions, new_name_to_pos
+
+
+def _chase_heavy_compute_blocker_chain(
+    candidate,
+    comp,
+    schedule,
+    seq: list,
+    positions: dict,
+    name_to_pos: dict,
+    comp_by_name: dict,
+    ag_start,
+    ag_done_pos: int,
+    ag_latency: float,
+    start_of_done: dict,
+    max_hops: int,
+    module_name: str = "",
+):
+    """Repeatedly try to relocate whatever's currently blocking `candidate`
+    from reaching a legal position inside window [ag_start, ag_done_pos),
+    up to `max_hops` times.
+
+    Complements _chase_exposed_collective_blocker_earlier (which only
+    chases a blocker that's specifically another exposed collective's
+    done): here the blocker can be *any* movable heavy op -- e.g.
+    dot_product_attention_fwd blocked by a GEMM that's itself blocked by
+    another GEMM two hops further back, the case that motivated this (see
+    the all-gather-start.8.g3 investigation: te_gemm_v2_ffi.81/.87 and the
+    attention op consuming them were all structurally reachable but none of
+    them were ever chased into place, because the fill scan only asks "is
+    the candidate legal *right now*", never "would relocating its blocker
+    first make it legal").
+
+    Each hop is delegated to _try_relocate_blocker_earlier, which only
+    commits a move if it strictly reduces _total_exposed_us across every
+    collective in the computation -- so a hop that would help `candidate`
+    but hurt the schedule overall more elsewhere is refused. Stops as soon
+    as a hop is refused (no further hops attempted from there), reaches
+    max_hops, or resolves the candidate's own floor.
+
+    Returns (changed, seq, positions, name_to_pos, floor, chain, blocker)
+    -- floor/chain/blocker are candidate's *current* _earliest_legal_pos
+    result after however many hops fired, so the caller can immediately
+    recheck `floor <= ag_done_pos` without a redundant extra call.
+    """
+    changed = False
+    floor, chain, blocker = _earliest_legal_pos(candidate, positions, name_to_pos, comp_by_name)
+    _logger.debug(
+        "collective_overlap_pass [%s]: CHC %s: initial floor=%d (window "
+        "done_pos=%d, gap=%d), blocker=%s, max_hops=%d.",
+        module_name, candidate.name, floor, ag_done_pos, floor - ag_done_pos,
+        blocker.name if blocker is not None else None, max_hops,
+    )
+    hops = 0
+    while floor > ag_done_pos and blocker is not None and hops < max_hops:
+        result = _try_relocate_blocker_earlier(
+            blocker, comp, schedule, seq, positions, name_to_pos, comp_by_name,
+            ag_start, ag_done_pos, ag_latency, start_of_done, module_name,
+        )
+        if result is None:
+            _logger.debug(
+                "collective_overlap_pass [%s]: CHC %s: hop %d refused to "
+                "relocate blocker %s (see preceding TRC line for reason) "
+                "-- stopping chain (floor still %d > done_pos %d).",
+                module_name, candidate.name, hops + 1, blocker.name,
+                floor, ag_done_pos,
+            )
+            break
+        seq, positions, name_to_pos = result
+        changed = True
+        hops += 1
+        prev_floor = floor
+        floor, chain, blocker = _earliest_legal_pos(
+            candidate, positions, name_to_pos, comp_by_name
+        )
+        _logger.debug(
+            "collective_overlap_pass [%s]: CHC %s: hop %d relocated -- "
+            "floor %d -> %d (done_pos=%d), next blocker=%s.",
+            module_name, candidate.name, hops, prev_floor, floor, ag_done_pos,
+            blocker.name if blocker is not None else None,
+        )
+    if floor > ag_done_pos:
+        _logger.debug(
+            "collective_overlap_pass [%s]: CHC %s: gave up after %d/%d "
+            "hop(s), still floor=%d > done_pos=%d (gap=%d)%s.",
+            module_name, candidate.name, hops, max_hops, floor, ag_done_pos,
+            floor - ag_done_pos,
+            " -- ran out of hops" if hops >= max_hops
+            else " -- blocker exhausted or last hop refused",
+        )
+    else:
+        _logger.debug(
+            "collective_overlap_pass [%s]: CHC %s: resolved after %d "
+            "hop(s) -- floor=%d <= done_pos=%d.",
+            module_name, candidate.name, hops, floor, ag_done_pos,
+        )
+    return changed, seq, positions, name_to_pos, floor, chain, blocker
+
+
+def _compute_covered_positions(
+    start_of_done: dict, positions: dict, comp_by_name: dict,
+) -> set:
+    """Schedule positions currently providing overlap for *some* collective
+    right now -- i.e. inside [start_pos+1, done_pos) for any collective with
+    a known PGLE latency, regardless of whether that collective is itself
+    still exposed or already fully hidden.
+
+    Used to restrict heavy-compute fill candidates to instructions that
+    aren't already helping another window: the direct-placement path below
+    (as opposed to the blocker-chase path, which already runs its move
+    through _find_best_blocker_position's whole-computation net-exposure
+    check) previously had no such guard at all -- it could yank a GEMM out
+    of an already-hidden collective's window to fill a different one,
+    silently exposing the first window as a side effect. Restricting
+    candidates to non-overlapped positions makes every direct placement
+    strictly non-destructive: moving something that currently overlaps
+    nothing can only ever help.
+    """
+    covered = set()
+    for ag_done, ag_start in start_of_done.items():
+        if ag_start not in positions or ag_done not in positions:
+            continue
+        profile_key = _resolve_profile_key(ag_start, comp_by_name)
+        latency = _profile_costs.get(profile_key)
+        if latency is None or latency <= 0:
+            continue
+        s, d = positions[ag_start], positions[ag_done]
+        if d > s + 1:
+            covered.update(range(s + 1, d))
+    return covered
 
 
 def _fill_exposed_collectives_with_heavy_compute(
@@ -830,6 +1656,17 @@ def _fill_exposed_collectives_with_heavy_compute(
     dependencies need checking, which _earliest_legal_pos already does.
     Repeats per window until its deficit is closed or no more legal
     candidates remain, then moves on to the next window.
+
+    Both scans below only ever consider candidates whose *current* position
+    isn't already inside some other collective's window (see
+    _compute_covered_positions) -- i.e. heavy compute that isn't providing
+    any overlap right now. This keeps every direct placement strictly
+    non-destructive: moving something that currently helps nobody can only
+    ever help. (The blocker-chase path is unaffected by this restriction --
+    it already runs every candidate move through
+    _find_best_blocker_position's whole-computation net-exposure check,
+    which already accounts for a blocker currently overlapping some other
+    window.)
     """
     changed = False
 
@@ -837,51 +1674,243 @@ def _fill_exposed_collectives_with_heavy_compute(
     for ag_done, ag_start in start_of_done.items():
         if ag_start not in positions or ag_done not in positions:
             continue
-        try:
-            profile_key = ag_start.async_wrapped_root().name
-        except Exception:
-            profile_key = ag_start.name
+        profile_key = _resolve_profile_key(ag_start, comp_by_name)
         latency = _profile_costs.get(profile_key)
         if latency is None or latency <= 0:
             continue
         start_pos = positions[ag_start]
         done_pos = positions[ag_done]
         overlap = sum(
-            _profile_costs.get(seq[i].name, 0.0) for i in range(start_pos + 1, done_pos)
+            _resolve_inst_cost(seq[i], comp_by_name) for i in range(start_pos + 1, done_pos)
         )
         deficit = latency - overlap
         if deficit > 0:
-            windows.append({"start": ag_start, "done": ag_done, "deficit": deficit})
+            is_fsdp = profile_key.startswith(_FSDP_COLLECTIVE_PREFIXES)
+            windows.append({
+                "start": ag_start, "done": ag_done, "deficit": deficit, "is_fsdp": is_fsdp,
+                "latency": latency,
+            })
 
     if not windows:
         return False, seq, positions, name_to_pos
 
     windows.sort(key=lambda w: positions[w["start"]])
     excluded = set(start_of_done.keys()) | set(start_of_done.values())
+    # "Exposed" means genuinely still under-hidden right now -- only these
+    # are candidates for _chase_exposed_collective_blocker_earlier, so we
+    # don't disturb collectives that are already adequately overlapped.
+    exposed_dones = {w["done"] for w in windows}
 
     for window in windows:
+        chase_hops = 0
         while window["deficit"] > 0:
             done_pos = positions[window["done"]]
             start_pos = positions[window["start"]]
+            # Recomputed fresh every iteration -- a prior move in this same
+            # while-loop shifts positions and can change which stretches of
+            # the schedule are covered.
+            covered_positions = _compute_covered_positions(
+                start_of_done, positions, comp_by_name
+            )
             candidate = None
             cand_floor = None
             cand_chain: list = []
-            for i in range(done_pos + 1, len(seq)):
-                inst = seq[i]
-                if inst in excluded:
+            # For FSDP-style (all-gather/reduce-scatter) windows, prioritize
+            # te_gemm/te_grouped_gemm custom-calls (the MoE GEMMs that
+            # dominate compute time in DeepSeek-family models -- see
+            # _is_te_gemm_custom_call): scan every legally-reachable te_gemm
+            # candidate (not just the first one encountered) and pick
+            # whichever has the EARLIEST legal floor, i.e. whichever can
+            # land closest to the window's own start -- a candidate
+            # encountered later in scan order (further from done_pos in the
+            # current schedule) can still have an earlier legal floor than
+            # one encountered first, since floor depends on a candidate's
+            # own dependency chain, not on its current position. Landing as
+            # close to start_pos as possible matters beyond just closing
+            # the deficit sum: the earlier a GEMM lands within the window,
+            # the more of the collective's real transfer time it actually
+            # has a chance to overlap. Only fall through to the
+            # unrestricted (first-legal-candidate) scan if no te_gemm is
+            # legally reachable at all. Non-FSDP windows (te_ep call-start
+            # etc.) skip straight to the unrestricted scan -- there's no
+            # particular reason to prefer a GEMM over any other heavy op
+            # there.
+            chased = False
+            if window["is_fsdp"]:
+                best_floor = None
+                for i in range(done_pos + 1, len(seq)):
+                    if i in covered_positions:
+                        # Already providing overlap for some other
+                        # collective right now -- skip it so a direct
+                        # placement (below) can never silently steal
+                        # overlap another window is relying on.
+                        continue
+                    inst = seq[i]
+                    if inst in excluded:
+                        continue
+                    if _is_trivially_movable_inst(inst, comp_by_name):
+                        continue
+                    if not _is_te_gemm_custom_call(inst, comp_by_name):
+                        continue
+                    cost = _resolve_inst_cost(inst, comp_by_name)
+                    if cost < _HEAVY_COMPUTE_MIN_US:
+                        continue
+                    floor, chain, blocker = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
+                    if floor > done_pos:
+                        # The candidate's own floor is pinned past our
+                        # window -- if that's specifically because it data-
+                        # depends on another still-exposed collective's
+                        # done sitting in between, try shrinking that gap by
+                        # chasing that collective's start earlier instead of
+                        # just giving up on this candidate.
+                        if blocker is not None and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS:
+                            chased, seq, positions, name_to_pos = (
+                                _chase_exposed_collective_blocker_earlier(
+                                    blocker, start_of_done, exposed_dones,
+                                    start_pos, done_pos, seq, schedule, comp,
+                                    positions, name_to_pos, comp_by_name,
+                                )
+                            )
+                            if chased:
+                                chase_hops += 1
+                                changed = True
+                                _logger.info(
+                                    "collective_overlap_pass [%s]: chased "
+                                    "exposed-collective blocker %s earlier "
+                                    "to unblock heavy-compute candidate %s "
+                                    "for window %s (deficit %.1f us "
+                                    "remaining).",
+                                    module_name, start_of_done[blocker].name,
+                                    inst.name, window["start"].name,
+                                    window["deficit"],
+                                )
+                                break
+                        # Blocker wasn't (or wasn't found to be) an exposed
+                        # collective -- try chasing it as an arbitrary
+                        # movable heavy op instead (e.g. another GEMM the
+                        # candidate transitively depends on). Gated on the
+                        # same chase_hops budget as the collective chase
+                        # above (incremented below on success) so repeated
+                        # while-loop iterations for this window can't invoke
+                        # unboundedly many chase attempts even though each
+                        # individual attempt's own internal hop count is
+                        # capped separately by _MAX_HEAVY_COMPUTE_CHASE_HOPS.
+                        if (
+                            not chased
+                            and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
+                            and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
+                        ):
+                            heavy_chased, seq, positions, name_to_pos, _, _, _ = (
+                                _chase_heavy_compute_blocker_chain(
+                                    inst, comp, schedule, seq, positions, name_to_pos,
+                                    comp_by_name, window["start"], done_pos,
+                                    window["latency"], start_of_done,
+                                    _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
+                                )
+                            )
+                            if heavy_chased:
+                                chase_hops += 1
+                                chased = True
+                                changed = True
+                                _logger.info(
+                                    "collective_overlap_pass [%s]: chased "
+                                    "heavy-compute blocker chain to try to "
+                                    "unblock candidate %s for window %s "
+                                    "(deficit %.1f us remaining).",
+                                    module_name, inst.name, window["start"].name,
+                                    window["deficit"],
+                                )
+                                break
+                        continue
+                    if best_floor is None or floor < best_floor:
+                        best_floor = floor
+                        candidate = inst
+                        cand_floor = floor
+                        cand_chain = chain
+
+            if chased:
+                # positions shifted under us -- re-derive done_pos/start_pos
+                # and rescan this window fresh next iteration.
+                continue
+
+            if candidate is None:
+                unrestricted_chased = False
+                for i in range(done_pos + 1, len(seq)):
+                    if i in covered_positions:
+                        continue
+                    inst = seq[i]
+                    if inst in excluded:
+                        continue
+                    if _is_trivially_movable_inst(inst, comp_by_name):
+                        continue
+                    cost = _resolve_inst_cost(inst, comp_by_name)
+                    if cost < _HEAVY_COMPUTE_MIN_US:
+                        continue
+                    floor, chain, blocker = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
+                    if floor > done_pos:
+                        # Same two-tier chase as the te_gemm-priority scan
+                        # above: first try the narrow exposed-collective
+                        # case, then fall back to chasing an arbitrary
+                        # movable heavy-compute blocker (e.g.
+                        # dot_product_attention_fwd blocked by a GEMM that's
+                        # itself blocked by another GEMM).
+                        if blocker is not None and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS:
+                            unrestricted_chased, seq, positions, name_to_pos = (
+                                _chase_exposed_collective_blocker_earlier(
+                                    blocker, start_of_done, exposed_dones,
+                                    start_pos, done_pos, seq, schedule, comp,
+                                    positions, name_to_pos, comp_by_name,
+                                )
+                            )
+                            if unrestricted_chased:
+                                chase_hops += 1
+                                changed = True
+                                _logger.info(
+                                    "collective_overlap_pass [%s]: chased "
+                                    "exposed-collective blocker %s earlier "
+                                    "to unblock heavy-compute candidate %s "
+                                    "for window %s (deficit %.1f us "
+                                    "remaining).",
+                                    module_name, start_of_done[blocker].name,
+                                    inst.name, window["start"].name,
+                                    window["deficit"],
+                                )
+                                break
+                        if (
+                            not unrestricted_chased
+                            and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
+                            and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
+                        ):
+                            unrestricted_chased, seq, positions, name_to_pos, _, _, _ = (
+                                _chase_heavy_compute_blocker_chain(
+                                    inst, comp, schedule, seq, positions, name_to_pos,
+                                    comp_by_name, window["start"], done_pos,
+                                    window["latency"], start_of_done,
+                                    _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
+                                )
+                            )
+                            if unrestricted_chased:
+                                chase_hops += 1
+                                changed = True
+                                _logger.info(
+                                    "collective_overlap_pass [%s]: chased "
+                                    "heavy-compute blocker chain to try to "
+                                    "unblock candidate %s for window %s "
+                                    "(deficit %.1f us remaining).",
+                                    module_name, inst.name, window["start"].name,
+                                    window["deficit"],
+                                )
+                                break
+                        continue
+                    candidate = inst
+                    cand_floor = floor
+                    cand_chain = chain
+                    break
+
+                if unrestricted_chased:
+                    # positions shifted under us -- re-derive done_pos/
+                    # start_pos and rescan this window fresh next iteration.
                     continue
-                if _is_trivially_movable_inst(inst, comp_by_name):
-                    continue
-                cost = _profile_costs.get(inst.name, 0.0)
-                if cost < _HEAVY_COMPUTE_MIN_US:
-                    continue
-                floor, chain, _ = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
-                if floor > done_pos:
-                    continue
-                candidate = inst
-                cand_floor = floor
-                cand_chain = chain
-                break
 
             if candidate is None:
                 break
@@ -900,7 +1929,7 @@ def _fill_exposed_collectives_with_heavy_compute(
             name_to_pos = {inst.name: i for inst, i in positions.items()}
             changed = True
 
-            cost = _profile_costs.get(candidate.name, 0.0)
+            cost = _resolve_inst_cost(candidate, comp_by_name)
             prev_deficit = window["deficit"]
             window["deficit"] = max(0.0, window["deficit"] - cost)
             _logger.info(
@@ -987,12 +2016,85 @@ def _innermost_first_computations(module, schedule) -> list:
     return result
 
 
+_WHILE_BODY_RE = re.compile(r"\bbody=%([A-Za-z0-9_.]+)")
+
+
+def _log_profile_coverage_gaps(module, schedule, module_name: str) -> None:
+    """Diagnostic: log fusion/custom-call instructions inside while-loop
+    bodies that have NO entry in _profile_costs.
+
+    _profile_costs is the PGLE-derived cost table every heavy-compute
+    decision in this pass relies on (deficit math,
+    _fill_exposed_collectives_with_heavy_compute, blocker relocation). A
+    missing entry is silently treated as cost 0.0 -- i.e. free -- by every
+    one of those `.get(name, 0.0)` lookups, with no error or warning
+    otherwise, which can hide a genuinely expensive op from every
+    heavy-compute code path.
+    """
+    all_comps = [
+        c for c in module.make_nonfusion_computations() if schedule.sequence(c) is not None
+    ]
+    comp_by_name = {c.name: c for c in all_comps}
+    while_bodies: set = set()
+    for comp in all_comps:
+        for inst in schedule.sequence(comp):
+            if _opcode_str(inst) != "while":
+                continue
+            try:
+                text = inst.to_string()
+            except Exception:
+                continue
+            for name in _WHILE_BODY_RE.findall(text):
+                body = comp_by_name.get(name)
+                if body is not None:
+                    while_bodies.add(body)
+
+    if not while_bodies:
+        return
+
+    missing: list[str] = []
+    present = 0
+    total = 0
+    for comp in while_bodies:
+        for inst in schedule.sequence(comp):
+            opc = _opcode_str(inst)
+            if opc not in ("fusion", "custom-call"):
+                continue
+            total += 1
+            if inst.name in _profile_costs:
+                present += 1
+            else:
+                missing.append(f"{inst.name}({opc})")
+
+    _logger.info(
+        "collective_overlap_pass [%s]: profile coverage in %d while-body "
+        "computation(s): %d/%d fusion/custom-call instructions have a "
+        "PGLE cost entry (%d missing).",
+        module_name, len(while_bodies), present, total, len(missing),
+    )
+    if missing:
+        _logger.info(
+            "collective_overlap_pass [%s]: missing-profile instructions "
+            "(first 150 of %d): %s",
+            module_name, len(missing), ", ".join(missing[:150]),
+        )
+
+
+# DIAGNOSTIC (temporary): module-wide accumulator of "already hidden"
+# verdicts, so _compute_collective_overlap can re-verify them again after
+# schedule.update()/module.set_schedule(), not just within the comp that
+# produced each verdict. Cleared at the top of each _phase1_reorder call.
+_diag_hidden_windows: list[dict] = []
+
+
 def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
     """Move async collective starts earlier where latency is under-hidden.
 
     Returns (changed, split_candidates) where split_candidates contains
     collectives that still had a deficit and were fully dep-blocked.
     """
+    global _diag_hidden_windows
+    _diag_hidden_windows = []
     changed = False
     split_candidates: list[_SplitCandidate] = []
     # Module-wide name->computation map (includes fusion sub-computations,
@@ -1027,26 +2129,42 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
         positions = {inst: i for i, inst in enumerate(seq)}
         name_to_pos = {inst.name: i for inst, i in positions.items()}
 
+        # DIAGNOSTIC (temporary): windows marked "already hidden" below are
+        # never revisited by this function. Record what justified that
+        # verdict here so we can re-check it against the *final* seq/
+        # positions for this comp, after the heavy-compute fill step has
+        # run -- see the re-verification block right after the
+        # _fill_exposed_collectives_with_heavy_compute call below.
+        already_hidden_snapshot: list[dict] = []
+
         for ag_done, ag_start in start_of_done.items():
-            try:
-                profile_key = ag_start.async_wrapped_root().name
-            except Exception:
-                profile_key = ag_start.name
+            profile_key = _resolve_profile_key(ag_start, comp_by_name)
             collective_latency = _profile_costs.get(profile_key)
             if collective_latency is None or collective_latency <= 0:
                 _logger.debug(
-                    "collective_overlap_pass [%s]: no profile entry for %s",
-                    module_name, ag_start.name,
+                    "collective_overlap_pass [%s]: no profile entry for %s "
+                    "(resolved profile key: %s).",
+                    module_name, ag_start.name, profile_key,
                 )
                 continue
 
             ag_start_pos = positions[ag_start]
             ag_done_pos = positions[ag_done]
 
-            current_overlap = sum(
-                _profile_costs.get(seq[i].name, 0.0)
+            window_costs = [
+                (seq[i].name, _resolve_inst_cost(seq[i], comp_by_name))
                 for i in range(ag_start_pos + 1, ag_done_pos)
-            )
+            ]
+            current_overlap = sum(c for _, c in window_costs)
+            if _logger.isEnabledFor(logging.DEBUG):
+                top = sorted((c for c in window_costs if c[1] > 0), key=lambda c: -c[1])[:10]
+                _logger.debug(
+                    "collective_overlap_pass [%s]: %s window [%d, %d) cost "
+                    "breakdown (top %d of %d nonzero, total=%.1f us): %s",
+                    module_name, ag_start.name, ag_start_pos + 1, ag_done_pos,
+                    len(top), sum(1 for _, c in window_costs if c > 0), current_overlap,
+                    ", ".join(f"{n}={c:.1f}us" for n, c in top),
+                )
 
             if current_overlap >= collective_latency:
                 _logger.debug(
@@ -1054,6 +2172,18 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                     "(overlap=%.1f us >= latency=%.1f us).",
                     module_name, ag_start.name, current_overlap, collective_latency,
                 )
+                _hidden_entry = {
+                    "comp": comp,
+                    "ag_start": ag_start,
+                    "ag_done": ag_done,
+                    "start_pos": ag_start_pos,
+                    "done_pos": ag_done_pos,
+                    "window_names": [n for n, _ in window_costs],
+                    "overlap": current_overlap,
+                    "latency": collective_latency,
+                }
+                already_hidden_snapshot.append(_hidden_entry)
+                _diag_hidden_windows.append(_hidden_entry)
                 continue
 
             deficit = collective_latency - current_overlap
@@ -1109,10 +2239,15 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
             # which _try_relocate_blocker_earlier reports by returning
             # None.
             hops = 0
-            while blocker is not None and hops < _MAX_PRODUCER_RELOCATE_HOPS:
+            while (
+                _ENABLE_RECURSIVE_BLOCKER_CHASE
+                and blocker is not None
+                and hops < _MAX_PRODUCER_RELOCATE_HOPS
+            ):
                 result = _try_relocate_blocker_earlier(
                     blocker, comp, schedule, seq, positions, name_to_pos, comp_by_name,
                     ag_start, positions[ag_done], collective_latency, start_of_done,
+                    module_name,
                 )
                 if result is None:
                     break
@@ -1140,7 +2275,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                     "(no legal earlier position, deficit=%.1f us).",
                     module_name, ag_start.name, deficit,
                 )
-                if deficit >= _SPLIT_DEFICIT_THRESHOLD_US:
+                if deficit >= _SPLIT_DEFICIT_THRESHOLD_US and ag_start.name.startswith(_SPLITTABLE_NAME_PREFIXES):
                     eff_positions = [
                         _effective_producer_pos(op, positions)
                         for op in ag_start.operands()
@@ -1151,6 +2286,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                         deficit_us=deficit,
                         comp_name=comp.name,
                         effective_producer_pos=eff_positions,
+                        total_latency_us=collective_latency,
                     ))
                 continue
 
@@ -1173,7 +2309,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
             new_ag_start_pos = positions[ag_start]
             new_ag_done_pos = positions[ag_done]
             new_overlap = sum(
-                _profile_costs.get(seq[i].name, 0.0)
+                _resolve_inst_cost(seq[i], comp_by_name)
                 for i in range(new_ag_start_pos + 1, new_ag_done_pos)
             )
             _logger.info(
@@ -1186,7 +2322,10 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
 
             if new_overlap < collective_latency:
                 remaining_deficit = collective_latency - new_overlap
-                if remaining_deficit >= _SPLIT_DEFICIT_THRESHOLD_US:
+                if (
+                    remaining_deficit >= _SPLIT_DEFICIT_THRESHOLD_US
+                    and ag_start.name.startswith(_SPLITTABLE_NAME_PREFIXES)
+                ):
                     eff_positions = [
                         _effective_producer_pos(op, positions)
                         for op in ag_start.operands()
@@ -1197,6 +2336,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                         deficit_us=remaining_deficit,
                         comp_name=comp.name,
                         effective_producer_pos=eff_positions,
+                        total_latency_us=collective_latency,
                     ))
 
         heavy_changed, seq, positions, name_to_pos = _fill_exposed_collectives_with_heavy_compute(
@@ -1219,7 +2359,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                     still_needed.append(cand)
                     continue
                 overlap = sum(
-                    _profile_costs.get(seq[i].name, 0.0)
+                    _resolve_inst_cost(seq[i], comp_by_name)
                     for i in range(start_pos + 1, done_pos)
                 )
                 latency = overlap + cand.deficit_us
@@ -1228,6 +2368,51 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                     cand.deficit_us = remaining
                     still_needed.append(cand)
             split_candidates = still_needed
+
+        # DIAGNOSTIC (temporary): re-check every "already hidden" verdict
+        # from this comp against the final seq/positions, since neither the
+        # per-collective loop nor the fill step above ever revisits it.
+        # Investigating a case (job 3159101, all-gather-start.9) where the
+        # instructions that justified "already hidden" ended up outside the
+        # window in the module actually handed back to XLA, despite no
+        # relocation log line ever naming them -- see if this flags it and
+        # pinpoints what moved.
+        for snap in already_hidden_snapshot:
+            ag_start = snap["ag_start"]
+            ag_done = snap["ag_done"]
+            if ag_start not in positions or ag_done not in positions:
+                _logger.warning(
+                    "collective_overlap_pass [%s]: DIAG %s / %s dropped "
+                    "from positions after fill (was window [%d, %d)).",
+                    module_name, ag_start.name, ag_done.name,
+                    snap["start_pos"], snap["done_pos"],
+                )
+                continue
+            new_start_pos = positions[ag_start]
+            new_done_pos = positions[ag_done]
+            new_window_names = [seq[i].name for i in range(new_start_pos + 1, new_done_pos)]
+            new_overlap = sum(
+                _resolve_inst_cost(seq[i], comp_by_name)
+                for i in range(new_start_pos + 1, new_done_pos)
+            )
+            if (
+                new_start_pos != snap["start_pos"]
+                or new_done_pos != snap["done_pos"]
+                or new_window_names != snap["window_names"]
+            ):
+                missing = [n for n in snap["window_names"] if n not in new_window_names]
+                _logger.warning(
+                    "collective_overlap_pass [%s]: DIAG %s window drifted "
+                    "after fill: was [%d, %d) contents=%s (overlap=%.1f, "
+                    "latency=%.1f) -> now [%d, %d) contents=%s (overlap=%.1f) "
+                    "-- vanished from window: %s%s",
+                    module_name, ag_start.name,
+                    snap["start_pos"], snap["done_pos"], snap["window_names"],
+                    snap["overlap"], snap["latency"],
+                    new_start_pos, new_done_pos, new_window_names, new_overlap,
+                    missing,
+                    " *** NO LONGER HIDDEN ***" if new_overlap < snap["latency"] else "",
+                )
 
     return changed, split_candidates
 
@@ -1511,6 +2696,21 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             cand.start_name, cand.deficit_us, len(groups), epoch_summaries,
         )
 
+        # Per-operand byte sizes, used below to estimate each new
+        # sub-collective's own latency as its share of the original
+        # collective's PGLE-measured total_latency_us, weighted by bytes
+        # transferred (the physically-motivated proxy for collective
+        # runtime) rather than splitting the latency evenly across groups.
+        # Without this, the post-split _phase1_reorder re-run has no PGLE
+        # entry for any new sub-collective (they didn't exist when
+        # profiling ran) and silently skips them entirely -- see
+        # _SplitCandidate.total_latency_us.
+        _operand_bytes = [
+            _proto_shape_bytes(id_to_inst[start_inst.operand_ids[i]].shape)
+            for i in range(n_operands)
+        ]
+        _total_operand_bytes = sum(_operand_bytes) or 1
+
         # --- For each group, build a sub-collective ---
         # new_pairs: (group_indices, new_start_id, new_done_id,
         # (group_indices, new_start_id, new_done_id, effective_insert_after_pos, group_op_ids)
@@ -1603,6 +2803,14 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             nr.name = f"{inner_inst.name}.g{g_idx}"
             nr.opcode = inner_inst.opcode
             nr.operand_ids.extend(new_param_ids)
+
+            _group_bytes = sum(_operand_bytes[i] for i in group)
+            _group_latency_us = cand.total_latency_us * (_group_bytes / _total_operand_bytes)
+            sys.stderr.write(
+                f"[split_core] GROUP_LATENCY {nr.name} {_group_latency_us:.6f} "
+                f"(bytes={_group_bytes}/{_total_operand_bytes}, "
+                f"total_latency={cand.total_latency_us:.1f}us)\n"
+            )
             nr.dimensions.extend(inner_inst.dimensions)
             # Copy the replica-group spec verbatim. Modern XLA usually encodes
             # this via collective_device_list (or iota_collective_device_list)
@@ -1831,8 +3039,21 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
     return proto.SerializeToString()
 
 
-def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> Optional[bytes]:
-    """Spawn a subprocess to run _phase2_split_core.
+_GROUP_LATENCY_RE = re.compile(r"^\[split_core\] GROUP_LATENCY (\S+) ([0-9.eE+-]+)")
+
+
+def _phase2_split_one_comp(
+    serialized_hlo: bytes, candidates: list[_SplitCandidate]
+) -> Optional[tuple[bytes, dict[str, float]]]:
+    """Spawn a subprocess to run _phase2_split_core for one computation's
+    worth of candidates.
+
+    _phase2_split_core resolves its target computation from
+    candidates[0].comp_name and looks every other candidate up by name in
+    that same computation -- callers (_phase2_split) must pre-group
+    candidates by comp_name and call this once per group, since a single
+    invocation silently drops any candidate that doesn't belong to
+    candidates[0]'s computation.
 
     The subprocess avoids protobuf descriptor pool conflicts that arise when
     jaxlib pre-registers xla/service/metrics.proto in the host process.
@@ -1854,6 +3075,7 @@ def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> O
             "deficit_us": c.deficit_us,
             "comp_name": c.comp_name,
             "effective_producer_pos": c.effective_producer_pos,
+            "total_latency_us": c.total_latency_us,
         } for c in candidates])
 
         result = subprocess.run(
@@ -1877,12 +3099,23 @@ def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> O
                 "collective_overlap_pass: split subprocess stderr:\n%s", _sub_stderr
             )
 
+        # Per-sub-collective latency estimates (profile_key -> latency_us),
+        # emitted by _phase2_split_core since the new sub-collectives have
+        # no PGLE profile entry of their own -- see
+        # _SplitCandidate.total_latency_us.
+        group_latencies: dict[str, float] = {}
+        for _line in _sub_stderr.splitlines():
+            _m = _GROUP_LATENCY_RE.match(_line)
+            if _m:
+                group_latencies[_m.group(1)] = float(_m.group(2))
+
         if result.stdout:
             _logger.info(
-                "collective_overlap_pass: split subprocess succeeded (%d bytes).",
-                len(result.stdout),
+                "collective_overlap_pass: split subprocess succeeded (%d bytes, "
+                "%d group latency estimate(s)).",
+                len(result.stdout), len(group_latencies),
             )
-            return result.stdout
+            return result.stdout, group_latencies
 
         _logger.info("collective_overlap_pass: split subprocess produced no output.")
         return None
@@ -1894,9 +3127,179 @@ def _phase2_split(serialized_hlo: bytes, candidates: list[_SplitCandidate]) -> O
             pass
 
 
+def _phase2_split(
+    serialized_hlo: bytes, candidates: list[_SplitCandidate]
+) -> Optional[tuple[bytes, dict[str, float]]]:
+    """Split every candidate, across however many computations they span.
+
+    split_candidates accumulated in _phase1_reorder commonly span multiple
+    computations at once (e.g. a while-loop body's call-start wrappers
+    alongside the entry computation's own plain all-gather-start), but
+    _phase2_split_one_comp / _phase2_split_core only ever look at one
+    computation per invocation (resolved from candidates[0].comp_name).
+    Group by comp_name and run one subprocess invocation per group,
+    chaining each group's output bytes into the next group's input so
+    earlier groups' splits are preserved. Returns None only if every group
+    failed to produce a split; otherwise returns the fully accumulated
+    result even if some groups failed.
+
+    Also merges each group's new-sub-collective latency estimates (see
+    _phase2_split_one_comp / _SplitCandidate.total_latency_us) into a single
+    dict the caller should feed into _profile_costs before re-running phase
+    1 on the split result -- otherwise the new sub-collectives have no PGLE
+    entry and the re-run silently skips every one of them.
+    """
+    if not candidates:
+        return None
+
+    groups: dict[str, list[_SplitCandidate]] = {}
+    for c in candidates:
+        groups.setdefault(c.comp_name or "", []).append(c)
+
+    current_bytes = serialized_hlo
+    any_succeeded = False
+    all_group_latencies: dict[str, float] = {}
+    for comp_name, group in groups.items():
+        result = _phase2_split_one_comp(current_bytes, group)
+        if result is not None:
+            current_bytes, group_latencies = result
+            all_group_latencies.update(group_latencies)
+            any_succeeded = True
+        else:
+            _logger.info(
+                "collective_overlap_pass: split produced no output for "
+                "comp '%s' (%d candidate(s)); leaving them unsplit.",
+                comp_name or "<module entry>", len(group),
+            )
+
+    return (current_bytes, all_group_latencies) if any_succeeded else None
+
+
 # ---------------------------------------------------------------------------
 # Top-level POST_SCHEDULER pass entry point
 # ---------------------------------------------------------------------------
+def _diag_recheck_hidden_windows(schedule, module_name: str, label: str) -> None:
+    """DIAGNOSTIC (temporary): re-verify every "already hidden" verdict
+    recorded in _diag_hidden_windows against a *fresh* read of
+    schedule.sequence(comp) -- independent of whatever seq/positions
+    _phase1_reorder was tracking internally, to rule out a bug in that
+    bookkeeping itself vs. a real schedule mutation between passes.
+    """
+    for snap in _diag_hidden_windows:
+        comp = snap["comp"]
+        ag_start = snap["ag_start"]
+        ag_done = snap["ag_done"]
+        seq = list(schedule.sequence(comp))
+        try:
+            new_start_pos = seq.index(ag_start)
+            new_done_pos = seq.index(ag_done)
+        except ValueError:
+            _logger.warning(
+                "collective_overlap_pass [%s]: DIAG[%s] %s / %s no longer "
+                "found in schedule.sequence(comp) at all (was window "
+                "[%d, %d)).",
+                module_name, label, ag_start.name, ag_done.name,
+                snap["start_pos"], snap["done_pos"],
+            )
+            continue
+        new_window_names = [seq[i].name for i in range(new_start_pos + 1, new_done_pos)]
+        if (
+            new_start_pos != snap["start_pos"]
+            or new_done_pos != snap["done_pos"]
+            or new_window_names != snap["window_names"]
+        ):
+            missing = [n for n in snap["window_names"] if n not in new_window_names]
+            _logger.warning(
+                "collective_overlap_pass [%s]: DIAG[%s] %s window drifted: "
+                "was [%d, %d) contents=%s (overlap=%.1f, latency=%.1f) -> "
+                "now [%d, %d) contents=%s -- vanished: %s",
+                module_name, label, ag_start.name,
+                snap["start_pos"], snap["done_pos"], snap["window_names"],
+                snap["overlap"], snap["latency"],
+                new_start_pos, new_done_pos, new_window_names, missing,
+            )
+        else:
+            _logger.info(
+                "collective_overlap_pass [%s]: DIAG[%s] %s window unchanged "
+                "([%d, %d), contents=%s) -- still consistent.",
+                module_name, label, ag_start.name,
+                new_start_pos, new_done_pos, new_window_names,
+            )
+
+
+# Cap on how many times we re-run _phase1_reorder against a freshly
+# schedule.update()'d module. See the loop in _compute_collective_overlap
+# for why this is needed at all: schedule.update()/verify() can silently
+# relocate an instruction whose true data dependency one of our own earlier
+# relocations invalidated elsewhere in the same comp, and that relocation
+# is invisible to _phase1_reorder's own seq/positions bookkeeping. Normal
+# runs converge in 1-2 iterations (the first iteration's relocations rarely
+# cascade into a second round of dependency violations); this is purely a
+# safety net against a pathological cascade never settling.
+_MAX_PHASE1_FIXED_POINT_ITERS = 4
+
+
+def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
+    """Run _phase1_reorder to a fixed point against `module`/`schedule`.
+
+    schedule.update()/verify() (required so XLA can canonicalize the
+    schedule after our raw seq mutations) can itself silently relocate an
+    instruction whose true data dependency one of our own earlier
+    relocations invalidated elsewhere in the same comp -- e.g. moving
+    collective A can shift instruction X across collective B's done,
+    without X itself ever being touched by name. That relocation is
+    invisible to _phase1_reorder (which only tracks its own seq/positions
+    bookkeeping, not what schedule.update() does afterward), so a window
+    _phase1_reorder scored "already hidden" can end up genuinely exposed by
+    the time schedule.update() finishes. Confirmed via the DIAG
+    instrumentation below on job 3161055: all-gather-start.9's window
+    (te_gemm_v2_ffi.93 et al.) was still intact immediately after
+    _phase1_reorder returned, and only vanished after
+    schedule.update()/verify()/set_schedule() -- because te_gemm_v2_ffi.93
+    has a real data dependency on all-gather-done.8 (a different
+    collective) that got invalidated in the same pass. Re-running
+    _phase1_reorder against the *post-update* schedule lets it notice the
+    now-genuinely-exposed window and re-fill it -- its forward candidate
+    scan can now also see instructions XLA's repair relocated to after the
+    window's `done` (e.g. dot_product_attention_fwd, previously invisible
+    to the scan because it started out scheduled before the collective's
+    own `start`).
+
+    Also used to re-optimize a module straight out of phase 2 (see
+    _compute_collective_overlap): _phase2_split_core is pure proto surgery
+    (grouping an existing collective's operands into new, smaller
+    sub-collectives + a topological-order fixup) -- it never re-derives
+    positions against real PGLE costs or runs the relocate/fill logic, so
+    the newly created sub-collectives start out wherever the topological
+    fixup happened to place them, not at their own earliest legal position.
+    """
+    changed = False
+    split_candidates: list[_SplitCandidate] = []
+    for _fp_iter in range(_MAX_PHASE1_FIXED_POINT_ITERS):
+        iter_changed, split_candidates = _phase1_reorder(module, schedule, module_name)
+        _diag_recheck_hidden_windows(
+            schedule, module_name,
+            f"fixed-point iter {_fp_iter}, immediately after _phase1_reorder return",
+        )
+        if not iter_changed:
+            break
+        changed = True
+        schedule.update()
+        schedule.verify()
+        module.set_schedule(schedule)
+        _diag_recheck_hidden_windows(
+            schedule, module_name,
+            f"fixed-point iter {_fp_iter}, after schedule.update()/verify()/set_schedule()",
+        )
+    else:
+        _logger.warning(
+            "collective_overlap_pass [%s]: phase 1 fixed point not reached "
+            "after %d iterations; proceeding with the current schedule.",
+            module_name, _MAX_PHASE1_FIXED_POINT_ITERS,
+        )
+    return changed, split_candidates
+
+
 def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
     """Phase 1: reorder; Phase 2: split batched collectives.
 
@@ -1923,13 +3326,12 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
             f"[collective_overlap_pass] === END ORIGINAL MODULE: {module_name} ===\n"
         )
 
+    _log_profile_coverage_gaps(module, schedule, module_name)
+
     # ---- Phase 1 ----
-    changed, split_candidates = _phase1_reorder(module, schedule, module_name)
+    changed, split_candidates = _run_phase1_to_fixed_point(module, schedule, module_name)
 
     if changed:
-        schedule.update()
-        schedule.verify()
-        module.set_schedule(schedule)
         phase1_bytes = module.as_serialized_hlo_module_proto()
     else:
         phase1_bytes = serialized_hlo
@@ -1940,8 +3342,42 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
             "collective_overlap_pass [%s]: %d split candidate(s) after phase 1.",
             module_name, len(split_candidates),
         )
-        phase2_bytes = _phase2_split(phase1_bytes, split_candidates)
-        if phase2_bytes is not None:
+        phase2_result = _phase2_split(phase1_bytes, split_candidates)
+        if phase2_result is not None:
+            phase2_bytes, group_latencies = phase2_result
+            # _phase2_split_core is pure proto surgery -- it never reorders
+            # or fills the newly created sub-collectives against real PGLE
+            # costs, and those sub-collectives have no PGLE entry of their
+            # own (they didn't exist when profiling ran). Seed
+            # _profile_costs with the byte-weighted latency estimates
+            # _phase2_split computed for them, so the post-split phase-1
+            # re-run below doesn't just silently skip every one of them.
+            if group_latencies:
+                _logger.info(
+                    "collective_overlap_pass [%s]: seeding %d sub-collective "
+                    "latency estimate(s) into _profile_costs before "
+                    "re-running phase 1 on the split result.",
+                    module_name, len(group_latencies),
+                )
+                _profile_costs.update(group_latencies)
+            # Re-run phase 1 on the split result so those sub-collectives
+            # actually get relocated to their own earliest legal position
+            # and their windows get filled, same as any other collective.
+            split_module = _hlo.HloModule.from_serialized_hlo_module_proto(phase2_bytes)
+            split_schedule = split_module.schedule()
+            if split_schedule is not None:
+                split_changed, split_split_candidates = _run_phase1_to_fixed_point(
+                    split_module, split_schedule, module_name
+                )
+                if split_split_candidates:
+                    _logger.info(
+                        "collective_overlap_pass [%s]: %d further split "
+                        "candidate(s) after re-optimizing the split result; "
+                        "not cascading into another split round.",
+                        module_name, len(split_split_candidates),
+                    )
+                if split_changed:
+                    phase2_bytes = split_module.as_serialized_hlo_module_proto()
             return _dump_final_module(module_name, phase2_bytes)
 
     if changed:
@@ -2279,6 +3715,46 @@ def _patch_pgle_profiler() -> None:
 
     _jax_profiler.PGLEProfiler.consume_fdo_profile = _consume_and_capture
     _logger.debug("collective_overlap_pass: patched PGLEProfiler.consume_fdo_profile")
+
+    # Also intercept the raw per-retry XSpace bytes, one level upstream of
+    # consume_fdo_profile: PGLEProfiler.trace() calls
+    # _profiler.get_fdo_profile(xspace) on each profiling retry's raw XSpace
+    # and only keeps the (lossy, per-kernel-mean -- see
+    # _load_te_ep_costs_from_xspace_bytes) converted result, discarding
+    # xspace itself once this call returns. Wrapping get_fdo_profile lets us
+    # compute correct te_ep_* costs from that same raw xspace before it's
+    # gone, live within this run's own PGLE profiling retries -- no
+    # reference trace or separate bootstrapping run needed. Global
+    # _te_ep_overrides_loaded is set here too so _apply_te_ep_cost_overrides
+    # (the reference-trace fallback, triggered later from _update_profile)
+    # skips its own load once live data is already in hand -- live data
+    # from this exact run is always preferable to a prior run's trace.
+    global _te_ep_overrides_loaded
+    _original_get_fdo_profile = _jax_profiler._profiler.get_fdo_profile
+
+    def _get_fdo_profile_and_capture_te_ep(xspace):
+        global _te_ep_overrides_loaded
+        try:
+            te_ep_costs = _load_te_ep_costs_from_xspace_bytes(bytes(xspace))
+        except Exception as exc:  # pylint: disable=broad-except
+            te_ep_costs = {}
+            _logger.warning(
+                "collective_overlap_pass: failed to extract te_ep_* costs "
+                "from live PGLE profiling data: %s", exc,
+            )
+        if te_ep_costs:
+            _te_ep_overrides.update(te_ep_costs)
+            _profile_costs.update(te_ep_costs)
+            _te_ep_overrides_loaded = True
+            _logger.info(
+                "collective_overlap_pass: captured %d live te_ep_* cost "
+                "correction(s) from this run's own PGLE profiling data.",
+                len(te_ep_costs),
+            )
+        return _original_get_fdo_profile(xspace)
+
+    _jax_profiler._profiler.get_fdo_profile = _get_fdo_profile_and_capture_te_ep
+    _logger.debug("collective_overlap_pass: patched _profiler.get_fdo_profile")
 
 
 # ---------------------------------------------------------------------------
