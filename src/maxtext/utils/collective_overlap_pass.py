@@ -131,33 +131,24 @@ def _update_profile(fdo_bytes: bytes) -> None:
 # ---------------------------------------------------------------------------
 # te_ep_* cost correction from a reference profiler trace
 # ---------------------------------------------------------------------------
-# PGLE's xplane->FDO conversion (xla/python/xplane_to_profile_instructions.cc,
-# ConvertXplaneToProfiledInstructionsProto) tags every individual GPU kernel
-# launch with its owning HLO instruction's name and stores cost_us as the MEAN
-# duration across all such launches. That's correct for an op that's one GPU
-# kernel. It's badly wrong for TE's expert-parallel dispatch/combine/prepare
-# custom-calls, each of which is actually *several* sequential GPU kernels
-# (e.g. te_ep_dispatch_ffi.N launches ~7: a couple of Memsets, a prob-density
-# conversion kernel, the NCCL dispatch kernel itself, another conversion
-# kernel, another Memset, and a local-permute kernel) all tagged with the same
-# HLO name -- PGLE averages across all of them (including several tiny ones),
-# producing a number close to the *per-kernel* mean rather than the *per-
-# invocation* total. Empirically confirmed on this workload: PGLE reports
-# ~459us for te_ep_dispatch_ffi.10 where the real, measured, single-invocation
-# wall-clock span (sum of its ~7 constituent kernels, since they run back-to-
-# back on the same stream) is ~3300us -- a ~7x underestimate. Every te_ep_*
-# family shows the same kind of underestimate (2x-22x depending on how many
-# tiny sub-kernels dilute the mean), so rather than trying to special-case
-# each family, this loads real per-invocation costs from a REFERENCE
-# profiler trace (a trace.json / trace.json.gz from any prior representative
-# run of this same workload, pointed to by COLLECTIVE_OVERLAP_REFERENCE_TRACE)
-# and overrides PGLE's te_ep_* entries with those instead.
+# PGLE's xplane->FDO conversion averages cost_us across every GPU kernel
+# launch tagged with an HLO instruction's name. That's correct for a
+# single-kernel op, but TE's expert-parallel dispatch/combine/prepare
+# custom-calls are each actually ~7 sequential GPU kernels (Memsets, a
+# prob-density conversion, the NCCL kernel itself, a local-permute, etc.)
+# sharing one HLO name -- PGLE's mean ends up close to the per-kernel
+# average, not the per-invocation total. Empirically confirmed: PGLE
+# reports ~459us for te_ep_dispatch_ffi.10 where the real per-invocation
+# wall-clock span is ~3300us (~7x underestimate; other te_ep_* families
+# show 2x-22x depending on how many tiny sub-kernels dilute the mean).
+# Rather than special-case each family, this loads real per-invocation
+# costs from a REFERENCE profiler trace (pointed to by
+# COLLECTIVE_OVERLAP_REFERENCE_TRACE) and overrides PGLE's te_ep_* entries.
 #
-# This has to be a *reference* trace rather than this run's own trace: the
-# pass runs during compilation, before this run's training steps (and hence
-# its own profiler capture) have happened. A two-pass workflow -- profile
-# once, then point subsequent runs at that trace -- mirrors how PGLE itself
-# already needs an initial profiling pass before it can recompile.
+# Must be a *reference* trace, not this run's own: the pass runs during
+# compilation, before this run has produced any profiler capture of its
+# own -- same two-pass (profile once, point later runs at it) workflow PGLE
+# itself needs.
 _TE_EP_PREFIX = "te_ep"
 _INVOCATION_GAP_US = 100.0  # gap between GPU-stream events that starts a new invocation
 _te_ep_overrides: dict[str, float] = {}
@@ -393,37 +384,28 @@ def _apply_te_ep_cost_overrides() -> None:
 # ---------------------------------------------------------------------------
 # Cross-rank sync (JAX's own distributed coordination service)
 # ---------------------------------------------------------------------------
-# Each rank's PGLE profile is measured independently from its own local NCCL/
-# kernel timings, which differ slightly rank-to-rank due to hardware/timing
-# noise. Since the pass's phase-1/phase-2 decisions (deficits, move targets,
-# split groupings) are a deterministic function of _profile_costs, different
-# _profile_costs across ranks can make different ranks schedule the *same*
-# SPMD program differently -- which is illegal (all ranks must compile an
-# identical executable).
+# Each rank's PGLE profile differs slightly (hardware/timing noise), and
+# since the pass's decisions are a deterministic function of
+# _profile_costs, different ranks could schedule the same SPMD program
+# differently -- illegal, since all ranks must compile an identical
+# executable.
 #
-# We used to fix this via an external cross-process broadcast library: first
-# by broadcasting rank 0's _profile_costs (syncing the *input*, which turned
-# out to be insufficient -- ranks still ended up with divergent schedules
-# even when their profile-cost inputs matched), then by having only rank 0
-# compute and broadcasting its *output* bytes (which sidesteps that, but
-# requires the external library's process group to actually span all ranks --
-# which in turn required extra Slurm launch flags that, on this cluster,
-# interfered with NCCL's own cross-node bootstrap and caused a *different*,
-# earlier hang).
+# Tried and rejected: broadcasting rank 0's _profile_costs (syncing the
+# *input*) -- insufficient, ranks still diverged even with matching inputs.
+# An external cross-process broadcast library for the *output* bytes
+# instead worked, but needed its process group to span all ranks, which
+# needed extra Slurm launch flags that interfered with NCCL's own
+# cross-node bootstrap and caused a different hang.
 #
-# Tracing stock JAX/XLA's own AutoPGLE FDO-profile sync
-# (jax/_src/compiler.py:_share_fdo_profiles) shows it solves this exact
-# problem using infrastructure already built into JAX: JAX's own distributed
-# coordination service (jax._src.distributed.global_state.client -- the same
-# "Jax service"/"JAX distributed service" every one of these multi-process
-# jobs is already connected to, since that's how the processes form a
-# cluster in the first place) as a simple key-value store. A designated
-# process publishes bytes under a content-derived key; every other process
-# does a blocking read on that same key. No extra library, no barriers, no
-# extra Slurm launch flags, no risk of colliding with NCCL's bootstrap. We do
-# the same thing here, publishing the pass's *output* bytes (as established
-# above, the output-broadcast strategy is the one that actually eliminates
-# divergence) instead of the FDO profile.
+# What we use instead: JAX's own distributed coordination service
+# (jax._src.distributed.global_state.client, already connected on every
+# multi-process job) as a plain key-value store -- mirrors how stock
+# JAX/XLA's AutoPGLE syncs FDO profiles
+# (jax/_src/compiler.py:_share_fdo_profiles). One process publishes bytes
+# under a content-derived key; everyone else does a blocking read on that
+# key. No extra library, no extra Slurm flags, no NCCL bootstrap collision.
+# We publish the pass's *output* bytes here (output-broadcast is the
+# strategy that actually eliminates divergence, per above).
 _dist_client = None
 _dist_checked = False
 
@@ -741,19 +723,15 @@ _TRIVIAL_SINGLE_OPCODES = frozenset({
     "get-tuple-element", "tuple", "copy", "slice",
     # "parameter"/"constant" are leaves with no real data dependency (a
     # parameter is available from the start of the computation; a constant
-    # is a compile-time literal) -- they were missing here even though
-    # _TRIVIAL_FUSED_OPCODES already treats them as trivial inside a fusion
-    # body. Without this, _earliest_legal_pos's chain walk treated wherever
-    # a param/constant happened to already be scheduled as a genuine
-    # "non-trivial blocker" pinning a candidate's floor -- and
-    # _try_relocate_blocker_earlier then refused to relocate it anyway,
-    # since its resolved cost is 0us (below _HEAVY_COMPUTE_MIN_US), a gate
-    # meant to skip cheap *fill candidates*, not to protect something that
-    # should always be freely movable. Confirmed via the TRC/CHC diagnostic
-    # logging on job 3174209: "cost < _HEAVY_COMPUTE_MIN_US" blocked by
-    # param/constant was the single largest refusal reason (thousands of
-    # hits) for why all-gather-start.8.g3's chase never got anywhere near
-    # te_gemm_v2_ffi.81/.87 or dot_product_attention_fwd.10.
+    # is compile-time), so they should always be freely movable -- but they
+    # were missing here even though _TRIVIAL_FUSED_OPCODES already treats
+    # them as trivial inside a fusion body. Without this, the chain walk
+    # treated wherever a param/constant happened to already sit as a
+    # genuine blocker, and the 0us-cost gate (meant to skip cheap *fill
+    # candidates*) then refused to relocate it either. Confirmed via job
+    # 3174209: this was the single largest refusal reason blocking
+    # all-gather-start.8.g3's chase from ever reaching te_gemm_v2_ffi.81/.87
+    # or dot_product_attention_fwd.10.
     "parameter", "constant",
 })
 
@@ -1095,36 +1073,48 @@ def _earliest_legal_pos(
 # or buggy chain that never terminates; it should not normally be reached.
 _MAX_PRODUCER_RELOCATE_HOPS = 64
 
-# Disabled for now: measured net-negative on the DeepSeek-small validation
-# workload even after fixing the landing-position off-by-len(chain) bug in
-# _find_best_blocker_position (job 3150632: 36.25% collective/compute
-# overlap, worse than both baseline (37.85%) and the simpler non-recursive
-# fix (39.34%) that only does the direction-(a) chain-relocation fix plus
-# _fill_exposed_collectives_with_heavy_compute). Root cause is believed to
-# be that _find_best_blocker_position's net-benefit check is a per-hop,
-# per-target-collective approximation -- it doesn't account for a later hop
-# (chasing a *different* collective's blocker) undoing the assumptions an
-# earlier hop's "net win" was computed under, so a sequence of individually
-# net-positive-looking moves can still add up to a net-negative schedule.
-# Re-enable only after that approximation is tightened.
-_ENABLE_RECURSIVE_BLOCKER_CHASE = False
+# A recursive variant of the direction-(a) chain-relocation fix below (chase
+# a collective's own blocker's own blocker, and so on) was tried and removed
+# -- measured net-negative (job 3150632: 36.25% overlap vs. 37.85% baseline
+# and 39.34% for the simpler non-recursive fix). Believed cause:
+# _find_best_blocker_position's net-benefit check is a per-hop
+# approximation that doesn't account for a later hop undoing an earlier
+# hop's "net win" assumption, so individually-positive moves can still sum
+# to a net-negative schedule. See git history if this ever gets revisited.
 
 # Bound on how many times _fill_exposed_collectives_with_heavy_compute will
-# chase "the blocker's own blocker" earlier for a single fill candidate that
-# isn't yet legally reachable (e.g. dot_product_attention_fwd blocked by a
-# GEMM that's itself blocked by another GEMM). Unlike
-# _ENABLE_RECURSIVE_BLOCKER_CHASE (which chases a *collective's own* blocker
-# recursively and was found net-negative -- see above), this chases a *fill
-# candidate's* blocker via _try_relocate_blocker_earlier, whose net-benefit
-# gate (_find_best_blocker_position / _total_exposed_us) already re-checks
-# total exposed time across the whole computation before committing each
-# hop -- so each hop is individually gated, though the same class of
-# cross-hop interaction _ENABLE_RECURSIVE_BLOCKER_CHASE's comment warns
-# about could in principle still apply here. Set
+# chase "the blocker's own blocker" for a single fill candidate that isn't
+# yet legally reachable. Unlike the recursive collective's-own-blocker
+# chase above (removed, net-negative), this chases a *fill candidate's*
+# blocker via _try_relocate_blocker_earlier, whose net-benefit gate already
+# re-checks total exposed time before committing each hop -- individually
+# gated, though the same cross-hop risk could in principle still apply. Set
 # COLLECTIVE_OVERLAP_HEAVY_CHASE_HOPS=0 to disable.
 _MAX_HEAVY_COMPUTE_CHASE_HOPS = int(
     os.environ.get("COLLECTIVE_OVERLAP_HEAVY_CHASE_HOPS", "8")
 )
+
+# _fill_exposed_collectives_with_heavy_compute used to build its `windows`
+# worklist once, as a snapshot of whichever collectives were exposed at
+# entry -- so a collective fully hidden at that instant never got added,
+# and if a *later* window's chase eroded its coverage, nothing would notice
+# or refill it until the next (costly) schedule.update()-mediated fixed
+# point in _run_phase1_to_fixed_point. This cap bounds an outer loop (the
+# `for _fp_iter in range(...)` below) that rebuilds the worklist from every
+# collective's fresh deficit each pass and keeps going until a pass makes
+# no further changes, so newly-exposed windows get picked back up
+# immediately instead of waiting for that costly outer fixed point.
+_MAX_FILL_FIXED_POINT_ITERS = 3
+
+# A chase that makes partial-but-insufficient progress on a candidate
+# causes the scan to restart from done_pos+1, by design (a deep chain often
+# needs several such restarts). But if the same candidate is the first
+# blocked thing found on every restart, this can consume the whole
+# chase_hops budget on one never-resolving candidate while other,
+# genuinely reachable candidates never get a turn. Give up on a candidate
+# once it's triggered this restart cycle this many times in a row without
+# resolving, so the scan can move past it.
+_STUCK_CANDIDATE_GIVE_UP_STREAK = 4
 
 
 def _resolve_inst_cost(inst, comp_by_name: dict) -> float:
@@ -1330,26 +1320,49 @@ def _try_relocate_blocker_earlier(
     ag_latency: float,
     start_of_done: dict,
     module_name: str = "",
+    position_margins: dict | None = None,
 ):
     """If `blocker` -- a non-trivial instruction pinning some collective's
     floor -- is itself a movable heavy op, relocate it (and its own trivial
-    operand chain) to whichever legal position between its current spot and
-    its own theoretical-earliest floor minimizes TOTAL exposed time across
-    every collective in this computation (see _find_best_blocker_position) --
-    not necessarily all the way to that floor.
+    operand chain) earlier, via one of two acceptance paths:
+
+    1. Whichever legal position between its current spot and its own
+       theoretical-earliest floor minimizes TOTAL exposed time across every
+       collective in this computation (see _find_best_blocker_position) --
+       not necessarily all the way to that floor. This is the original,
+       strict path: a hop is only accepted if it visibly improves the
+       aggregate metric.
+
+    2. (Only if `position_margins` is given -- i.e. only from the
+       heavy-compute chase, never from the disabled general recursive
+       chase, to avoid resurrecting whatever made that net-negative) a
+       margin-safe fallback straight to `floor`: accepted if blocker's own
+       cost never exceeds the slack (_compute_position_margins) of
+       whatever collective(s) currently cover its position, even if this
+       specific hop doesn't show up as an aggregate improvement. This
+       exists because path 1's net-exposure gate is myopic across a chain:
+       relocating a small op by one or two positions often looks like a
+       pure wash in isolation (its own contribution to any window's
+       overlap sum is negligible either way), even when it's a necessary
+       link in a longer chain that only pays off once the ORIGINAL
+       candidate several hops downstream finally becomes reachable -- see
+       the all-gather-start.8.g3 / input_reduce_fusion.60 investigation
+       (job 3179392), where input_reduce_fusion.60 had genuine room to
+       move but every hop was refused by path 1 despite being perfectly
+       margin-safe. Path 2 is weaker than path 1 (no aggregate-improvement
+       requirement) but still strictly safe: it can never push a
+       currently-fine collective's overlap below its own latency.
 
     Moving a producer to an earlier position can never break its own
     downstream consumers: in any valid schedule a consumer already sits
     after its producer, so it still does after the producer moves to an
     even earlier (but still legal) position. What CAN happen is that pulling
     it out of its current spot steals overlap headroom some *other*
-    already-hidden collective was relying on -- which is exactly what the
-    net-effect search above guards against, by refusing to move past the
-    point where the total exposed time (target + everyone else) stops
-    improving.
+    already-hidden collective was relying on -- which is exactly what both
+    paths above guard against, just via two different safety criteria.
 
-    Returns the refreshed (seq, positions, name_to_pos) if a beneficial move
-    happened, else None.
+    Returns the refreshed (seq, positions, name_to_pos) if a move happened,
+    else None.
     """
     if blocker not in positions:
         _logger.debug(
@@ -1394,34 +1407,59 @@ def _try_relocate_blocker_earlier(
     # the insertion-start that reproduces "leave blocker exactly where it
     # is" (blocker_pos itself is a landing position, not an insertion
     # start -- see _find_best_blocker_position's docstring).
-    if best_pos >= blocker_pos - len(chain):
+    current_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
+    improves_total = (
+        best_pos < blocker_pos - len(chain) and best_exposed < current_total - 1e-6
+    )
+
+    target = None
+    if improves_total:
+        target = best_pos
+        _logger.debug(
+            "collective_overlap_pass [%s]: TRC %s: relocating from pos %d "
+            "to %d (chain len %d) -- total exposed %.1f -> %.1f us "
+            "(path 1: aggregate improvement).",
+            module_name, blocker.name, blocker_pos, best_pos + len(chain),
+            len(chain), current_total, best_exposed,
+        )
+    elif position_margins is not None:
+        margin = position_margins.get(blocker_pos, float("inf"))
+        if cost <= margin:
+            target = floor
+            _logger.debug(
+                "collective_overlap_pass [%s]: TRC %s: relocating from pos "
+                "%d to %d (chain len %d) -- no aggregate improvement "
+                "(best_exposed=%.1f us vs current=%.1f us) but margin-safe "
+                "(cost=%.1f us <= margin=%.1f us at its own position) "
+                "(path 2: margin-safe).",
+                module_name, blocker.name, blocker_pos, floor + len(chain),
+                len(chain), best_exposed, current_total, cost, margin,
+            )
+        else:
+            _logger.debug(
+                "collective_overlap_pass [%s]: TRC %s: no aggregate "
+                "improvement (best_exposed=%.1f us vs current=%.1f us) AND "
+                "not margin-safe (cost=%.1f us > margin=%.1f us at its own "
+                "position) -- refusing.",
+                module_name, blocker.name, best_exposed, current_total,
+                cost, margin,
+            )
+    else:
         _logger.debug(
             "collective_overlap_pass [%s]: TRC %s: own floor=%d is legal "
             "(pos %d, room to move to %d), but no candidate landing "
             "position in [floor, current] reduces total exposed time "
-            "(best_exposed=%.1f us) -- refusing.",
-            module_name, blocker.name, floor, blocker_pos, final_pos, best_exposed,
+            "(best_exposed=%.1f us vs current=%.1f us) -- refusing.",
+            module_name, blocker.name, floor, blocker_pos, final_pos,
+            best_exposed, current_total,
         )
-        return None  # no candidate position actually reduces total exposed time
-    current_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
-    if best_exposed >= current_total - 1e-6:
-        _logger.debug(
-            "collective_overlap_pass [%s]: TRC %s: best candidate position "
-            "%d exposes %.1f us total >= current %.1f us -- net loss/wash, "
-            "refusing.",
-            module_name, blocker.name, best_pos, best_exposed, current_total,
-        )
-        return None  # net loss or a wash -- not worth the churn
 
-    _logger.debug(
-        "collective_overlap_pass [%s]: TRC %s: relocating from pos %d to "
-        "%d (chain len %d) -- total exposed %.1f -> %.1f us.",
-        module_name, blocker.name, blocker_pos, best_pos + len(chain), len(chain),
-        current_total, best_exposed,
-    )
+    if target is None:
+        return None
+
     to_move_set = set(chain) | {blocker}
     new_seq = [inst for inst in seq if inst not in to_move_set]
-    ins_pos = best_pos
+    ins_pos = target
     for inst in chain:  # already in topological (schedule) order
         new_seq.insert(ins_pos, inst)
         ins_pos += 1
@@ -1452,8 +1490,9 @@ def _chase_exposed_collective_blocker_earlier(
     blocking, instead of leaving that candidate permanently disqualified.
 
     Unlike _try_relocate_blocker_earlier (which chases an arbitrary heavy op
-    blocking a collective, and was found net-negative in its general form --
-    see _ENABLE_RECURSIVE_BLOCKER_CHASE), this only fires for the narrow,
+    blocking a collective, and was found net-negative when applied
+    recursively to a collective's own blocker -- see the removed
+    recursive-chase code, job 3150632), this only fires for the narrow,
     concrete case the caller has already identified: a real data dependency
     on another exposed collective's done sitting between this window and a
     candidate that would otherwise fill it. Relocating that collective's
@@ -1499,6 +1538,39 @@ def _chase_exposed_collective_blocker_earlier(
     return True, new_seq, new_positions, new_name_to_pos
 
 
+def _find_relocatable_ancestor(
+    inst, positions: dict, name_to_pos: dict, comp_by_name: dict, max_depth: int,
+):
+    """Walk `inst`'s own blocker chain until finding an ancestor with
+    genuine *structural* room to move -- its own floor + trivial chain
+    lands strictly before its current position -- as opposed to one that's
+    already exactly as early as its own dependencies allow.
+
+    Purely structural: does not consider cost or net exposure at all, so
+    the returned instruction (if any) still MUST be run through
+    _try_relocate_blocker_earlier's full gating before actually being
+    moved. That gate -- unchanged, exactly as it already protects a
+    single-hop chase -- is what refuses to disrupt an already-hidden
+    collective; this function only ever decides *which* instruction to
+    offer to that gate, never bypasses it.
+
+    Returns the relocatable ancestor (possibly `inst` itself), or None if
+    the chain bottoms out (no further blocker, a dependency cycle, or
+    max_depth exhausted) before finding one.
+    """
+    seen = set()
+    cur = inst
+    for _ in range(max_depth + 1):
+        if cur is None or cur in seen or cur not in positions:
+            return None
+        seen.add(cur)
+        floor, chain, sub_blocker = _earliest_legal_pos(cur, positions, name_to_pos, comp_by_name)
+        if floor + len(chain) < positions[cur]:
+            return cur
+        cur = sub_blocker
+    return None
+
+
 def _chase_heavy_compute_blocker_chain(
     candidate,
     comp,
@@ -1513,10 +1585,18 @@ def _chase_heavy_compute_blocker_chain(
     start_of_done: dict,
     max_hops: int,
     module_name: str = "",
+    position_margins: dict | None = None,
 ):
     """Repeatedly try to relocate whatever's currently blocking `candidate`
     from reaching a legal position inside window [ag_start, ag_done_pos),
     up to `max_hops` times.
+
+    `position_margins` (see _compute_position_margins), if given, is
+    forwarded to _try_relocate_blocker_earlier to enable its margin-safe
+    fallback acceptance path -- without it, a hop is only accepted if it
+    visibly improves aggregate total exposed time, which is often too
+    myopic to ever unblock a candidate several hops away (see that
+    function's docstring, path 2).
 
     Complements _chase_exposed_collective_blocker_earlier (which only
     chases a blocker that's specifically another exposed collective's
@@ -1529,12 +1609,26 @@ def _chase_heavy_compute_blocker_chain(
     the candidate legal *right now*", never "would relocating its blocker
     first make it legal").
 
-    Each hop is delegated to _try_relocate_blocker_earlier, which only
-    commits a move if it strictly reduces _total_exposed_us across every
-    collective in the computation -- so a hop that would help `candidate`
-    but hurt the schedule overall more elsewhere is refused. Stops as soon
-    as a hop is refused (no further hops attempted from there), reaches
-    max_hops, or resolves the candidate's own floor.
+    A blocker that has no room to move on its own (already sitting exactly
+    at its own floor) doesn't end the chain anymore: before giving up, each
+    hop first walks *structurally* down that blocker's own blocker chain
+    (_find_relocatable_ancestor, no mutation, no gating) to find an
+    ancestor that genuinely can move, then hands *that* instruction to
+    _try_relocate_blocker_earlier -- unchanged, still the sole thing that
+    actually commits a move, and still only ever commits one if it strictly
+    reduces _total_exposed_us across every collective in the computation.
+    So a hop that would help `candidate` but hurt an already-hidden
+    collective elsewhere is refused exactly as before; this only changes
+    *which* instruction gets offered to that gate, never bypasses it. Two
+    hops are typically needed to actually unblock `candidate` through an
+    indirect blocker: one to relocate the deep ancestor, a second (the next
+    iteration of this same while loop, since `candidate`'s own blocker is
+    re-derived fresh after every hop) to relocate the now-newly-movable
+    direct blocker itself.
+
+    Stops as soon as a hop is refused or no relocatable ancestor exists
+    within the remaining hop budget (no further hops attempted from
+    there), reaches max_hops, or resolves the candidate's own floor.
 
     Returns (changed, seq, positions, name_to_pos, floor, chain, blocker)
     -- floor/chain/blocker are candidate's *current* _earliest_legal_pos
@@ -1551,31 +1645,61 @@ def _chase_heavy_compute_blocker_chain(
     )
     hops = 0
     while floor > ag_done_pos and blocker is not None and hops < max_hops:
-        result = _try_relocate_blocker_earlier(
-            blocker, comp, schedule, seq, positions, name_to_pos, comp_by_name,
-            ag_start, ag_done_pos, ag_latency, start_of_done, module_name,
+        target = _find_relocatable_ancestor(
+            blocker, positions, name_to_pos, comp_by_name, max_hops - hops
         )
+        if target is None:
+            _logger.debug(
+                "collective_overlap_pass [%s]: CHC %s: blocker %s (and its "
+                "own blocker chain) has no relocatable ancestor within the "
+                "remaining hop budget (%d left) -- stopping chain.",
+                module_name, candidate.name, blocker.name, max_hops - hops,
+            )
+            break
+        if target is not blocker:
+            _logger.debug(
+                "collective_overlap_pass [%s]: CHC %s: blocker %s has no "
+                "room itself -- descending to its own blocker %s instead.",
+                module_name, candidate.name, blocker.name, target.name,
+            )
+        result = _try_relocate_blocker_earlier(
+            target, comp, schedule, seq, positions, name_to_pos, comp_by_name,
+            ag_start, ag_done_pos, ag_latency, start_of_done, module_name,
+            position_margins,
+        )
+        hops += 1
         if result is None:
             _logger.debug(
                 "collective_overlap_pass [%s]: CHC %s: hop %d refused to "
-                "relocate blocker %s (see preceding TRC line for reason) "
-                "-- stopping chain (floor still %d > done_pos %d).",
-                module_name, candidate.name, hops + 1, blocker.name,
+                "relocate %s (see preceding TRC line for reason) -- "
+                "stopping chain (floor still %d > done_pos %d).",
+                module_name, candidate.name, hops, target.name,
                 floor, ag_done_pos,
             )
             break
         seq, positions, name_to_pos = result
         changed = True
-        hops += 1
+        if position_margins is not None:
+            # Recompute fresh after every hop, not just once per outer
+            # while-iteration: a single chase call can commit up to
+            # max_hops relocations back-to-back, and reusing the
+            # pre-chase margin snapshot across all of them would let
+            # several individually-safe-looking hops cumulatively draw
+            # more from the same window's slack than it actually has --
+            # each hop must see the *current* remaining slack, not the
+            # slack as of before this chase call started.
+            position_margins = _compute_position_margins(
+                start_of_done, positions, seq, comp_by_name
+            )
         prev_floor = floor
         floor, chain, blocker = _earliest_legal_pos(
             candidate, positions, name_to_pos, comp_by_name
         )
         _logger.debug(
-            "collective_overlap_pass [%s]: CHC %s: hop %d relocated -- "
+            "collective_overlap_pass [%s]: CHC %s: hop %d relocated %s -- "
             "floor %d -> %d (done_pos=%d), next blocker=%s.",
-            module_name, candidate.name, hops, prev_floor, floor, ag_done_pos,
-            blocker.name if blocker is not None else None,
+            module_name, candidate.name, hops, target.name, prev_floor, floor,
+            ag_done_pos, blocker.name if blocker is not None else None,
         )
     if floor > ag_done_pos:
         _logger.debug(
@@ -1595,26 +1719,40 @@ def _chase_heavy_compute_blocker_chain(
     return changed, seq, positions, name_to_pos, floor, chain, blocker
 
 
-def _compute_covered_positions(
-    start_of_done: dict, positions: dict, comp_by_name: dict,
-) -> set:
-    """Schedule positions currently providing overlap for *some* collective
-    right now -- i.e. inside [start_pos+1, done_pos) for any collective with
-    a known PGLE latency, regardless of whether that collective is itself
-    still exposed or already fully hidden.
+def _compute_position_margins(
+    start_of_done: dict, positions: dict, seq: list, comp_by_name: dict,
+    prefix: list | None = None,
+) -> dict:
+    """For every schedule position, the minimum slack (current overlap
+    minus latency) among all collectives whose [start_pos+1, done_pos)
+    window covers it right now -- i.e. how much cost could be pulled out of
+    that position without dropping ANY covering collective's overlap below
+    its own latency. A position covered by no collective simply has no
+    entry (callers treat that as infinite margin via .get(i, inf)).
 
-    Used to restrict heavy-compute fill candidates to instructions that
-    aren't already helping another window: the direct-placement path below
-    (as opposed to the blocker-chase path, which already runs its move
-    through _find_best_blocker_position's whole-computation net-exposure
-    check) previously had no such guard at all -- it could yank a GEMM out
-    of an already-hidden collective's window to fill a different one,
-    silently exposing the first window as a side effect. Restricting
-    candidates to non-overlapped positions makes every direct placement
-    strictly non-destructive: moving something that currently overlaps
-    nothing can only ever help.
+    Generalizes what used to be a binary covered/not-covered distinction
+    (a position was either fully off-limits or fully free): a position
+    sitting inside a massively over-covered window -- e.g. one with 30x
+    more overlap than its latency needs -- is just as safe to relocate from
+    as genuinely idle time, as long as no more than the real slack is
+    taken. Refusing ANY move touching a covered position regardless of
+    margin was needlessly conservative. Confirmed via the DIAG WATCH
+    instrumentation on job 3179259: te_gemm_v2_ffi.81/.87/.78/.84 and
+    dot_product_attention_fwd.10 were permanently excluded from
+    all-gather-start.8.g3's window because they sit inside windows like
+    all-gather-start.11's (overlap=36885us against a latency of just
+    2690us -- ~34ms of pure slack) even though stealing a few hundred
+    microseconds of GEMM cost from there could never have exposed it.
+
+    Used to restrict heavy-compute fill candidates so a direct placement
+    (below) can never silently push some other collective's overlap below
+    its own latency -- the blocker-chase path already gets the equivalent
+    protection from _find_best_blocker_position's whole-computation
+    net-exposure check; this is that same guarantee for direct placement.
     """
-    covered = set()
+    if prefix is None:
+        prefix = _prefix_costs_excluding(seq, (), comp_by_name)
+    margins: dict[int, float] = {}
     for ag_done, ag_start in start_of_done.items():
         if ag_start not in positions or ag_done not in positions:
             continue
@@ -1623,9 +1761,70 @@ def _compute_covered_positions(
         if latency is None or latency <= 0:
             continue
         s, d = positions[ag_start], positions[ag_done]
-        if d > s + 1:
-            covered.update(range(s + 1, d))
-    return covered
+        if d <= s + 1:
+            continue
+        overlap = prefix[d] - prefix[s + 1]
+        slack = overlap - latency
+        for p in range(s + 1, d):
+            if p not in margins or slack < margins[p]:
+                margins[p] = slack
+    return margins
+
+
+_GIVE_UP_MODES = ("none", "streak", "floor_aware")
+
+
+class _StuckCandidateTracker:
+    """Decides when a repeatedly-encountered blocked candidate should be
+    given up on (skipped in the scan) so other candidates get a turn --
+    see the caller for why this matters. Three strategies, tried against
+    each other per computation by _fill_exposed_collectives_best_of (see
+    that function's docstring for the measured trade-off between them):
+
+    - "none": never gives up -- the original always-retry behavior.
+    - "streak": tracks only the single most-recently-stuck candidate name
+      and a running count; a *different* name interrupting the streak
+      resets it, even for the original candidate. Cheap and, empirically,
+      the safest general default -- see job 3184713.
+    - "floor_aware": tracks every candidate independently and only counts
+      a repeat if its _earliest_legal_pos floor failed to improve since
+      last seen (genuine multi-hop progress, however many hops it takes,
+      never counts against it). More precise in principle, but empirically
+      let some truly-stuck candidates (whose floor inches down slightly
+      without ever actually resolving) consume more budget than "streak"
+      does -- see job 3187886.
+    """
+
+    def __init__(self, give_up_mode: str):
+        self.give_up_mode = give_up_mode
+        self._last_name: str | None = None
+        self._last_streak = 0
+        self._streak_by_name: dict[str, int] = {}
+        self._last_floor_by_name: dict[str, int] = {}
+
+    def note_and_maybe_give_up(self, name: str, floor: int) -> tuple[int, bool]:
+        """Record that `name` was just found blocked at `floor`. Returns
+        (streak, should_give_up_now)."""
+        if self.give_up_mode == "none":
+            return 0, False
+        if self.give_up_mode == "streak":
+            if name == self._last_name:
+                self._last_streak += 1
+            else:
+                self._last_name = name
+                self._last_streak = 1
+            streak = self._last_streak
+        elif self.give_up_mode == "floor_aware":
+            prev_floor = self._last_floor_by_name.get(name)
+            if prev_floor is not None and floor >= prev_floor:
+                self._streak_by_name[name] = self._streak_by_name.get(name, 0) + 1
+            else:
+                self._streak_by_name[name] = 1
+            self._last_floor_by_name[name] = floor
+            streak = self._streak_by_name[name]
+        else:
+            raise ValueError(f"unknown give_up_mode: {self.give_up_mode!r}")
+        return streak, streak >= _STUCK_CANDIDATE_GIVE_UP_STREAK
 
 
 def _fill_exposed_collectives_with_heavy_compute(
@@ -1637,309 +1836,492 @@ def _fill_exposed_collectives_with_heavy_compute(
     name_to_pos: dict,
     comp_by_name: dict,
     module_name: str,
+    give_up_mode: str = "streak",
 ) -> tuple[bool, list, dict, dict]:
     """Pull heavy compute instructions backward into earlier collectives'
     still-exposed [start, done) windows, to help hide their latency.
 
-    Builds a bookkeeping list of every collective in `comp` that still has
-    unhidden latency (deficit > 0) after the start-relocation pass above,
-    ordered earliest-start-first. For each open window, scans forward from
-    its `done` instruction for a heavy compute instruction (a real kernel --
-    not a trivial bitcast/reshape/elementwise op -- with profiled cost at
-    or above _HEAVY_COMPUTE_MIN_US) whose own real dependencies (found the
-    same way _earliest_legal_pos finds them for a collective start) already
-    sit at or before the window's `done` instruction, and relocates it into
-    the window. Moving an instruction to an *earlier* position can never
+    Runs an outer fixed-point loop (up to _MAX_FILL_FIXED_POINT_ITERS
+    passes): each pass builds a fresh bookkeeping list of EVERY collective
+    in `comp`, recomputing deficit (unhidden latency) from the real,
+    current overlap -- not just the ones that looked exposed at the start
+    of this function -- ordered earliest-start-first, and only proceeds to
+    a next pass if the previous one actually relocated/chased something.
+    This matters because both the direct-placement scan and the
+    blocker-chase fallbacks below can, as a side effect of fixing one
+    window, relocate instructions that happened to be covering a
+    *different* window -- including one that was already fully hidden and
+    so wasn't even in this pass's worklist. Without rebuilding the full
+    worklist from scratch every pass, such newly-exposed collectives would
+    never get revisited within this function call at all, and would only
+    surface already-exposed on the next (much more expensive,
+    schedule.update()-mediated) _run_phase1_to_fixed_point iteration --
+    confirmed happening in practice (job 3181428: call-start.2, .4, .38,
+    and all-gather-start.8.g2 went from fully hidden to newly exposed
+    purely as a side effect of other windows' chases, invisible to a
+    single-snapshot worklist).
+
+    For each open window, scans forward from its `done` instruction for a
+    heavy compute instruction (a real kernel -- not a trivial
+    bitcast/reshape/elementwise op -- with profiled cost at or above
+    _HEAVY_COMPUTE_MIN_US) whose own real dependencies (found the same way
+    _earliest_legal_pos finds them for a collective start) already sit at
+    or before the window's `done` instruction, and relocates it into the
+    window. Moving an instruction to an *earlier* position can never
     violate its own downstream consumers: in any valid schedule a consumer
     already sits after its producer, so it still sits after the new, even
     earlier, position too -- only upstream (operand/control-predecessor)
     dependencies need checking, which _earliest_legal_pos already does.
-    Repeats per window until its deficit is closed or no more legal
-    candidates remain, then moves on to the next window.
+    Repeats per window (re-deriving that window's own deficit from the
+    real overlap sum every inner iteration too, for the same reason --
+    see the comment at the top of the inner while loop) until its deficit
+    is closed or no more legal candidates remain, then moves on to the
+    next window.
 
-    Both scans below only ever consider candidates whose *current* position
-    isn't already inside some other collective's window (see
-    _compute_covered_positions) -- i.e. heavy compute that isn't providing
-    any overlap right now. This keeps every direct placement strictly
-    non-destructive: moving something that currently helps nobody can only
-    ever help. (The blocker-chase path is unaffected by this restriction --
-    it already runs every candidate move through
-    _find_best_blocker_position's whole-computation net-exposure check,
-    which already accounts for a blocker currently overlapping some other
-    window.)
+    Both scans below only ever consider candidates whose cost doesn't
+    exceed the slack of whatever collective(s) currently cover their
+    position (see _compute_position_margins) -- i.e. heavy compute that
+    isn't providing overlap anyone actually still needs. This keeps every
+    direct placement strictly non-destructive: moving something can never
+    push another collective's overlap below its own latency, but genuinely
+    idle time and merely over-covered time are both fair game. (The
+    blocker-chase path is unaffected by this restriction -- it already runs
+    every candidate move through _find_best_blocker_position's
+    whole-computation net-exposure check, a finer-grained version of the
+    same guarantee.)
     """
     changed = False
+    # Per-collective deficit as of the end of the previous outer pass. A
+    # window whose deficit is unchanged since then was already scanned to
+    # exhaustion (deterministic search over unchanged state repeats the
+    # same outcome), so its inner while-loop is skipped this pass -- keeps
+    # the fixed-point loop from redoing real chase work every iteration.
+    prev_deficit_by_name: dict[str, float] = {}
 
-    windows: list[dict] = []
-    for ag_done, ag_start in start_of_done.items():
-        if ag_start not in positions or ag_done not in positions:
-            continue
-        profile_key = _resolve_profile_key(ag_start, comp_by_name)
-        latency = _profile_costs.get(profile_key)
-        if latency is None or latency <= 0:
-            continue
-        start_pos = positions[ag_start]
-        done_pos = positions[ag_done]
-        overlap = sum(
-            _resolve_inst_cost(seq[i], comp_by_name) for i in range(start_pos + 1, done_pos)
-        )
-        deficit = latency - overlap
-        if deficit > 0:
-            is_fsdp = profile_key.startswith(_FSDP_COLLECTIVE_PREFIXES)
-            windows.append({
-                "start": ag_start, "done": ag_done, "deficit": deficit, "is_fsdp": is_fsdp,
-                "latency": latency,
-            })
+    for _fp_iter in range(_MAX_FILL_FIXED_POINT_ITERS):
+        pass_changed = False
 
-    if not windows:
-        return False, seq, positions, name_to_pos
-
-    windows.sort(key=lambda w: positions[w["start"]])
-    excluded = set(start_of_done.keys()) | set(start_of_done.values())
-    # "Exposed" means genuinely still under-hidden right now -- only these
-    # are candidates for _chase_exposed_collective_blocker_earlier, so we
-    # don't disturb collectives that are already adequately overlapped.
-    exposed_dones = {w["done"] for w in windows}
-
-    for window in windows:
-        chase_hops = 0
-        while window["deficit"] > 0:
-            done_pos = positions[window["done"]]
-            start_pos = positions[window["start"]]
-            # Recomputed fresh every iteration -- a prior move in this same
-            # while-loop shifts positions and can change which stretches of
-            # the schedule are covered.
-            covered_positions = _compute_covered_positions(
-                start_of_done, positions, comp_by_name
-            )
-            candidate = None
-            cand_floor = None
-            cand_chain: list = []
-            # For FSDP-style (all-gather/reduce-scatter) windows, prioritize
-            # te_gemm/te_grouped_gemm custom-calls (the MoE GEMMs that
-            # dominate compute time in DeepSeek-family models -- see
-            # _is_te_gemm_custom_call): scan every legally-reachable te_gemm
-            # candidate (not just the first one encountered) and pick
-            # whichever has the EARLIEST legal floor, i.e. whichever can
-            # land closest to the window's own start -- a candidate
-            # encountered later in scan order (further from done_pos in the
-            # current schedule) can still have an earlier legal floor than
-            # one encountered first, since floor depends on a candidate's
-            # own dependency chain, not on its current position. Landing as
-            # close to start_pos as possible matters beyond just closing
-            # the deficit sum: the earlier a GEMM lands within the window,
-            # the more of the collective's real transfer time it actually
-            # has a chance to overlap. Only fall through to the
-            # unrestricted (first-legal-candidate) scan if no te_gemm is
-            # legally reachable at all. Non-FSDP windows (te_ep call-start
-            # etc.) skip straight to the unrestricted scan -- there's no
-            # particular reason to prefer a GEMM over any other heavy op
-            # there.
-            chased = False
-            if window["is_fsdp"]:
-                best_floor = None
-                for i in range(done_pos + 1, len(seq)):
-                    if i in covered_positions:
-                        # Already providing overlap for some other
-                        # collective right now -- skip it so a direct
-                        # placement (below) can never silently steal
-                        # overlap another window is relying on.
-                        continue
-                    inst = seq[i]
-                    if inst in excluded:
-                        continue
-                    if _is_trivially_movable_inst(inst, comp_by_name):
-                        continue
-                    if not _is_te_gemm_custom_call(inst, comp_by_name):
-                        continue
-                    cost = _resolve_inst_cost(inst, comp_by_name)
-                    if cost < _HEAVY_COMPUTE_MIN_US:
-                        continue
-                    floor, chain, blocker = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
-                    if floor > done_pos:
-                        # The candidate's own floor is pinned past our
-                        # window -- if that's specifically because it data-
-                        # depends on another still-exposed collective's
-                        # done sitting in between, try shrinking that gap by
-                        # chasing that collective's start earlier instead of
-                        # just giving up on this candidate.
-                        if blocker is not None and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS:
-                            chased, seq, positions, name_to_pos = (
-                                _chase_exposed_collective_blocker_earlier(
-                                    blocker, start_of_done, exposed_dones,
-                                    start_pos, done_pos, seq, schedule, comp,
-                                    positions, name_to_pos, comp_by_name,
-                                )
-                            )
-                            if chased:
-                                chase_hops += 1
-                                changed = True
-                                _logger.info(
-                                    "collective_overlap_pass [%s]: chased "
-                                    "exposed-collective blocker %s earlier "
-                                    "to unblock heavy-compute candidate %s "
-                                    "for window %s (deficit %.1f us "
-                                    "remaining).",
-                                    module_name, start_of_done[blocker].name,
-                                    inst.name, window["start"].name,
-                                    window["deficit"],
-                                )
-                                break
-                        # Blocker wasn't (or wasn't found to be) an exposed
-                        # collective -- try chasing it as an arbitrary
-                        # movable heavy op instead (e.g. another GEMM the
-                        # candidate transitively depends on). Gated on the
-                        # same chase_hops budget as the collective chase
-                        # above (incremented below on success) so repeated
-                        # while-loop iterations for this window can't invoke
-                        # unboundedly many chase attempts even though each
-                        # individual attempt's own internal hop count is
-                        # capped separately by _MAX_HEAVY_COMPUTE_CHASE_HOPS.
-                        if (
-                            not chased
-                            and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
-                            and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
-                        ):
-                            heavy_chased, seq, positions, name_to_pos, _, _, _ = (
-                                _chase_heavy_compute_blocker_chain(
-                                    inst, comp, schedule, seq, positions, name_to_pos,
-                                    comp_by_name, window["start"], done_pos,
-                                    window["latency"], start_of_done,
-                                    _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
-                                )
-                            )
-                            if heavy_chased:
-                                chase_hops += 1
-                                chased = True
-                                changed = True
-                                _logger.info(
-                                    "collective_overlap_pass [%s]: chased "
-                                    "heavy-compute blocker chain to try to "
-                                    "unblock candidate %s for window %s "
-                                    "(deficit %.1f us remaining).",
-                                    module_name, inst.name, window["start"].name,
-                                    window["deficit"],
-                                )
-                                break
-                        continue
-                    if best_floor is None or floor < best_floor:
-                        best_floor = floor
-                        candidate = inst
-                        cand_floor = floor
-                        cand_chain = chain
-
-            if chased:
-                # positions shifted under us -- re-derive done_pos/start_pos
-                # and rescan this window fresh next iteration.
+        windows: list[dict] = []
+        cur_deficit_by_name: dict[str, float] = {}
+        # One shared O(n) prefix for this whole worklist rebuild, instead of
+        # an O(window size) sum per collective -- matters since this now
+        # reruns every outer pass for every collective in start_of_done, not
+        # just the currently-exposed ones.
+        worklist_prefix = _prefix_costs_excluding(seq, (), comp_by_name)
+        for ag_done, ag_start in start_of_done.items():
+            if ag_start not in positions or ag_done not in positions:
                 continue
+            profile_key = _resolve_profile_key(ag_start, comp_by_name)
+            latency = _profile_costs.get(profile_key)
+            if latency is None or latency <= 0:
+                continue
+            start_pos = positions[ag_start]
+            done_pos = positions[ag_done]
+            overlap = worklist_prefix[done_pos] - worklist_prefix[start_pos + 1]
+            deficit = latency - overlap
+            cur_deficit_by_name[ag_start.name] = deficit
+            if deficit > 0:
+                is_fsdp = profile_key.startswith(_FSDP_COLLECTIVE_PREFIXES)
+                prev = prev_deficit_by_name.get(ag_start.name)
+                unchanged_since_last_pass = (
+                    _fp_iter > 0 and prev is not None and abs(prev - deficit) < 1e-6
+                )
+                windows.append({
+                    "start": ag_start, "done": ag_done, "deficit": deficit, "is_fsdp": is_fsdp,
+                    "latency": latency, "skip": unchanged_since_last_pass,
+                })
 
-            if candidate is None:
-                unrestricted_chased = False
-                for i in range(done_pos + 1, len(seq)):
-                    if i in covered_positions:
-                        continue
-                    inst = seq[i]
-                    if inst in excluded:
-                        continue
-                    if _is_trivially_movable_inst(inst, comp_by_name):
-                        continue
-                    cost = _resolve_inst_cost(inst, comp_by_name)
-                    if cost < _HEAVY_COMPUTE_MIN_US:
-                        continue
-                    floor, chain, blocker = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
-                    if floor > done_pos:
-                        # Same two-tier chase as the te_gemm-priority scan
-                        # above: first try the narrow exposed-collective
-                        # case, then fall back to chasing an arbitrary
-                        # movable heavy-compute blocker (e.g.
-                        # dot_product_attention_fwd blocked by a GEMM that's
-                        # itself blocked by another GEMM).
-                        if blocker is not None and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS:
-                            unrestricted_chased, seq, positions, name_to_pos = (
-                                _chase_exposed_collective_blocker_earlier(
-                                    blocker, start_of_done, exposed_dones,
-                                    start_pos, done_pos, seq, schedule, comp,
-                                    positions, name_to_pos, comp_by_name,
-                                )
-                            )
-                            if unrestricted_chased:
-                                chase_hops += 1
-                                changed = True
-                                _logger.info(
-                                    "collective_overlap_pass [%s]: chased "
-                                    "exposed-collective blocker %s earlier "
-                                    "to unblock heavy-compute candidate %s "
-                                    "for window %s (deficit %.1f us "
-                                    "remaining).",
-                                    module_name, start_of_done[blocker].name,
-                                    inst.name, window["start"].name,
-                                    window["deficit"],
-                                )
-                                break
-                        if (
-                            not unrestricted_chased
-                            and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
-                            and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
-                        ):
-                            unrestricted_chased, seq, positions, name_to_pos, _, _, _ = (
-                                _chase_heavy_compute_blocker_chain(
-                                    inst, comp, schedule, seq, positions, name_to_pos,
-                                    comp_by_name, window["start"], done_pos,
-                                    window["latency"], start_of_done,
-                                    _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
-                                )
-                            )
-                            if unrestricted_chased:
-                                chase_hops += 1
-                                changed = True
-                                _logger.info(
-                                    "collective_overlap_pass [%s]: chased "
-                                    "heavy-compute blocker chain to try to "
-                                    "unblock candidate %s for window %s "
-                                    "(deficit %.1f us remaining).",
-                                    module_name, inst.name, window["start"].name,
-                                    window["deficit"],
-                                )
-                                break
-                        continue
-                    candidate = inst
-                    cand_floor = floor
-                    cand_chain = chain
+        prev_deficit_by_name = cur_deficit_by_name
+
+        if not windows:
+            break
+
+        windows.sort(key=lambda w: positions[w["start"]])
+        excluded = set(start_of_done.keys()) | set(start_of_done.values())
+        # "Exposed" means genuinely still under-hidden right now -- only these
+        # are candidates for _chase_exposed_collective_blocker_earlier, so we
+        # don't disturb collectives that are already adequately overlapped.
+        exposed_dones = {w["done"] for w in windows}
+
+        # Two collectives' [start, done) windows can genuinely overlap in
+        # the schedule (both async collectives in flight concurrently --
+        # confirmed for real call-start pairs, e.g. region_19.46's
+        # call-start.56/.58). A single instruction relocated into that
+        # shared zone counts toward both windows' overlap for free
+        # (window["deficit"] is always recomputed from the real schedule,
+        # so this gets picked up automatically). What direct placement
+        # doesn't do on its own is *prefer* such double-benefit placements
+        # among several legal candidates -- computed once per outer pass
+        # (a best-effort snapshot, not re-derived every hop).
+        sibling_ranges: dict[str, list[tuple[int, int]]] = {}
+        for w in windows:
+            s, d = positions[w["start"]], positions[w["done"]]
+            for other in windows:
+                if other is w:
+                    continue
+                os_, od = positions[other["start"]], positions[other["done"]]
+                if os_ < d and s < od:  # ranges [s, d) and [os_, od) overlap
+                    sibling_ranges.setdefault(w["start"].name, []).append((os_, od))
+
+        for window in windows:
+            if window["skip"]:
+                continue
+            window_siblings = sibling_ranges.get(window["start"].name, [])
+            chase_hops = 0
+            # A chase making partial progress triggers an immediate
+            # break+rescan-from-done_pos+1, so a second hop can pick up
+            # where the first left off (see
+            # _chase_heavy_compute_blocker_chain's docstring). But if the
+            # SAME candidate is the first blocked thing hit on every rescan
+            # (a deep or unresolvable chain), it can loop indefinitely
+            # hammering just that one candidate while other reachable
+            # candidates later in scan order never get a turn. Confirmed in
+            # job 3184492: dot_product_attention_fwd.33.double_buffer_clone
+            # alone consumed 448-636 chase attempts without resolving,
+            # while te_gemm_v2_ffi.286-310 in the same computation were
+            # essentially never tried. Track whether each candidate's floor
+            # is actually improving across rescans (keep going) vs.
+            # flat/worse (give up, skip it, let others through) -- strategy
+            # controlled by give_up_mode (see _StuckCandidateTracker).
+            #
+            # NOTE: a round-robin variant (one placement per window per
+            # round, interleaved across windows) was tried to address
+            # run-to-run allocation instability under PGLE cost jitter
+            # (jobs 3190682 vs 3190969), then reverted (job 3191562) --
+            # interleaving let one window's chase disrupt another's
+            # in-progress chase, causing more total churn than draining
+            # each window fully before starting the next.
+            stuck_tracker = _StuckCandidateTracker(give_up_mode)
+            given_up_candidates: set[str] = set()
+            while window["deficit"] > 0:
+                done_pos = positions[window["done"]]
+                start_pos = positions[window["start"]]
+                # Re-derive deficit from the real overlap sum every iteration
+                # rather than trusting an incremental "deficit -= cost"
+                # counter. A chase invoked below can relocate *other*
+                # instructions as a side effect, including ones already
+                # inside this window, bumping them back out past `done_pos`
+                # -- an incremental counter can't notice coverage being
+                # undone and would double-credit the displaced-and-replaced
+                # instruction. Shared with the position-margins call right
+                # below (one O(n) prefix instead of two).
+                iter_prefix = _prefix_costs_excluding(seq, (), comp_by_name)
+                window["deficit"] = max(
+                    0.0, window["latency"] - (iter_prefix[done_pos] - iter_prefix[start_pos + 1])
+                )
+                if window["deficit"] <= 0:
                     break
+                # Recomputed fresh every iteration -- a prior move in this same
+                # while-loop shifts positions and can change which stretches of
+                # the schedule are covered and by how much slack.
+                position_margins = _compute_position_margins(
+                    start_of_done, positions, seq, comp_by_name, prefix=iter_prefix,
+                )
+                candidate = None
+                cand_floor = None
+                cand_chain: list = []
+                # For FSDP-style (all-gather/reduce-scatter) windows, prefer
+                # te_gemm/te_grouped_gemm custom-calls (the MoE GEMMs that
+                # dominate compute time in DeepSeek-family models -- see
+                # _is_te_gemm_custom_call): scan every legally-reachable
+                # te_gemm candidate and pick whichever has the EARLIEST
+                # legal floor (floor depends on dependency chain, not
+                # current scan position, so a later-encountered candidate
+                # can still have an earlier floor). Landing closer to
+                # start_pos lets the GEMM overlap more of the collective's
+                # transfer time, not just close the deficit sum. Falls
+                # through to the unrestricted scan only if no te_gemm is
+                # legally reachable. Non-FSDP windows skip straight to the
+                # unrestricted scan -- no reason to prefer a GEMM there.
+                chased = False
+                if window["is_fsdp"]:
+                    best_floor = None
+                    for i in range(done_pos + 1, len(seq)):
+                        inst = seq[i]
+                        if inst in excluded:
+                            continue
+                        if inst.name in given_up_candidates:
+                            continue
+                        if _is_trivially_movable_inst(inst, comp_by_name):
+                            continue
+                        if not _is_te_gemm_custom_call(inst, comp_by_name):
+                            continue
+                        cost = _resolve_inst_cost(inst, comp_by_name)
+                        if cost < _HEAVY_COMPUTE_MIN_US:
+                            continue
+                        if cost > position_margins.get(i, float("inf")):
+                            # Relocating this would push some other collective's
+                            # overlap below its own latency -- skip it so a
+                            # direct placement (below) can never silently
+                            # expose a window that's currently fine (even one
+                            # with lots of slack -- just not THIS much).
+                            continue
+                        floor, chain, blocker = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
+                        if floor > done_pos:
+                            streak, give_up_now = stuck_tracker.note_and_maybe_give_up(
+                                inst.name, floor
+                            )
+                            if give_up_now:
+                                given_up_candidates.add(inst.name)
+                                _logger.debug(
+                                    "collective_overlap_pass [%s]: FSDP scan "
+                                    "for window %s: giving up on %s after %d "
+                                    "consecutive unresolved chase restarts "
+                                    "(mode=%s, floor stuck at %d) -- skipping "
+                                    "it for the rest of this window's scan.",
+                                    module_name, window["start"].name, inst.name,
+                                    streak, give_up_mode, floor,
+                                )
+                            # The candidate's own floor is pinned past our
+                            # window -- if that's specifically because it data-
+                            # depends on another still-exposed collective's
+                            # done sitting in between, try shrinking that gap by
+                            # chasing that collective's start earlier instead of
+                            # just giving up on this candidate.
+                            if blocker is not None and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS:
+                                chased, seq, positions, name_to_pos = (
+                                    _chase_exposed_collective_blocker_earlier(
+                                        blocker, start_of_done, exposed_dones,
+                                        start_pos, done_pos, seq, schedule, comp,
+                                        positions, name_to_pos, comp_by_name,
+                                    )
+                                )
+                                if chased:
+                                    chase_hops += 1
+                                    changed = True
+                                    pass_changed = True
+                                    _logger.info(
+                                        "collective_overlap_pass [%s]: chased "
+                                        "exposed-collective blocker %s earlier "
+                                        "to unblock heavy-compute candidate %s "
+                                        "for window %s (deficit %.1f us "
+                                        "remaining).",
+                                        module_name, start_of_done[blocker].name,
+                                        inst.name, window["start"].name,
+                                        window["deficit"],
+                                    )
+                                    break
+                            # Blocker wasn't an exposed collective -- try
+                            # chasing it as an arbitrary movable heavy op
+                            # instead (e.g. another GEMM the candidate
+                            # transitively depends on). Gated on the same
+                            # chase_hops budget as the collective chase above.
+                            if (
+                                not chased
+                                and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
+                                and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
+                            ):
+                                heavy_chased, seq, positions, name_to_pos, _, _, _ = (
+                                    _chase_heavy_compute_blocker_chain(
+                                        inst, comp, schedule, seq, positions, name_to_pos,
+                                        comp_by_name, window["start"], done_pos,
+                                        window["latency"], start_of_done,
+                                        _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
+                                        position_margins,
+                                    )
+                                )
+                                if heavy_chased:
+                                    chase_hops += 1
+                                    chased = True
+                                    changed = True
+                                    pass_changed = True
+                                    _logger.info(
+                                        "collective_overlap_pass [%s]: chased "
+                                        "heavy-compute blocker chain to try to "
+                                        "unblock candidate %s for window %s "
+                                        "(deficit %.1f us remaining).",
+                                        module_name, inst.name, window["start"].name,
+                                        window["deficit"],
+                                    )
+                                    break
+                            continue
+                        if best_floor is None or floor < best_floor:
+                            best_floor = floor
+                            candidate = inst
+                            cand_floor = floor
+                            cand_chain = chain
 
-                if unrestricted_chased:
-                    # positions shifted under us -- re-derive done_pos/
-                    # start_pos and rescan this window fresh next iteration.
+                if chased:
+                    # positions shifted under us -- re-derive done_pos/start_pos
+                    # and rescan this window fresh next iteration.
+                    _logger.debug(
+                        "collective_overlap_pass [%s]: DIAG FSDP scan for "
+                        "window %s diverted into a chase (chase_hops=%d/%d) -- "
+                        "restarting this window's scan from scratch instead of "
+                        "reaching the unrestricted scan this pass.",
+                        module_name, window["start"].name, chase_hops,
+                        _MAX_PRODUCER_RELOCATE_HOPS,
+                    )
                     continue
 
-            if candidate is None:
-                break
+                if candidate is None:
+                    _logger.debug(
+                        "collective_overlap_pass [%s]: DIAG unrestricted scan "
+                        "reached for window %s (done_pos=%d, is_fsdp=%s, "
+                        "chase_hops=%d/%d).",
+                        module_name, window["start"].name, done_pos,
+                        window["is_fsdp"], chase_hops, _MAX_PRODUCER_RELOCATE_HOPS,
+                    )
+                    unrestricted_chased = False
+                    # Collect every legal candidate instead of stopping at
+                    # the first -- taking the first-found regardless of size
+                    # can badly overshoot a small deficit (e.g. spending a
+                    # 960us GEMM to close a 400us gap), stranding the
+                    # surplus and making it unavailable to a different
+                    # window that needed exactly that much. Best-fit is
+                    # picked below, after the loop, from everything legally
+                    # reachable this pass. Chase attempts still break out
+                    # and restart immediately; only direct placement defers.
+                    legal_candidates: list[tuple] = []
+                    for i in range(done_pos + 1, len(seq)):
+                        inst = seq[i]
+                        if inst in excluded:
+                            continue
+                        if inst.name in given_up_candidates:
+                            continue
+                        if _is_trivially_movable_inst(inst, comp_by_name):
+                            continue
+                        cost = _resolve_inst_cost(inst, comp_by_name)
+                        if cost < _HEAVY_COMPUTE_MIN_US:
+                            continue
+                        if cost > position_margins.get(i, float("inf")):
+                            continue
+                        floor, chain, blocker = _earliest_legal_pos(inst, positions, name_to_pos, comp_by_name)
+                        if floor > done_pos:
+                            streak, give_up_now = stuck_tracker.note_and_maybe_give_up(
+                                inst.name, floor
+                            )
+                            if give_up_now:
+                                given_up_candidates.add(inst.name)
+                                _logger.debug(
+                                    "collective_overlap_pass [%s]: unrestricted "
+                                    "scan for window %s: giving up on %s after "
+                                    "%d consecutive unresolved chase restarts "
+                                    "(mode=%s, floor stuck at %d) -- skipping "
+                                    "it for the rest of this window's scan.",
+                                    module_name, window["start"].name, inst.name,
+                                    streak, give_up_mode, floor,
+                                )
+                            # Same two-tier chase as the te_gemm-priority scan
+                            # above: exposed-collective case first, then fall
+                            # back to an arbitrary movable heavy-compute
+                            # blocker chain.
+                            if blocker is not None and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS:
+                                unrestricted_chased, seq, positions, name_to_pos = (
+                                    _chase_exposed_collective_blocker_earlier(
+                                        blocker, start_of_done, exposed_dones,
+                                        start_pos, done_pos, seq, schedule, comp,
+                                        positions, name_to_pos, comp_by_name,
+                                    )
+                                )
+                                if unrestricted_chased:
+                                    chase_hops += 1
+                                    changed = True
+                                    pass_changed = True
+                                    _logger.info(
+                                        "collective_overlap_pass [%s]: chased "
+                                        "exposed-collective blocker %s earlier "
+                                        "to unblock heavy-compute candidate %s "
+                                        "for window %s (deficit %.1f us "
+                                        "remaining).",
+                                        module_name, start_of_done[blocker].name,
+                                        inst.name, window["start"].name,
+                                        window["deficit"],
+                                    )
+                                    break
+                            if (
+                                not unrestricted_chased
+                                and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
+                                and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
+                            ):
+                                unrestricted_chased, seq, positions, name_to_pos, _, _, _ = (
+                                    _chase_heavy_compute_blocker_chain(
+                                        inst, comp, schedule, seq, positions, name_to_pos,
+                                        comp_by_name, window["start"], done_pos,
+                                        window["latency"], start_of_done,
+                                        _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
+                                        position_margins,
+                                    )
+                                )
+                                if unrestricted_chased:
+                                    chase_hops += 1
+                                    changed = True
+                                    pass_changed = True
+                                    _logger.info(
+                                        "collective_overlap_pass [%s]: chased "
+                                        "heavy-compute blocker chain to try to "
+                                        "unblock candidate %s for window %s "
+                                        "(deficit %.1f us remaining).",
+                                        module_name, inst.name, window["start"].name,
+                                        window["deficit"],
+                                    )
+                                    break
+                            continue
+                        legal_candidates.append((inst, floor, chain, cost))
 
-            target = max(cand_floor, start_pos + 1)
-            to_move_set = set(cand_chain) | {candidate}
-            new_seq = [inst for inst in seq if inst not in to_move_set]
-            ins_pos = target
-            for inst in cand_chain:  # already in topological (schedule) order
-                new_seq.insert(ins_pos, inst)
-                ins_pos += 1
-            new_seq.insert(ins_pos, candidate)
-            schedule.set_sequence(comp, new_seq)
-            seq = new_seq
-            positions = {inst: i for i, inst in enumerate(seq)}
-            name_to_pos = {inst.name: i for inst, i in positions.items()}
-            changed = True
+                    if unrestricted_chased:
+                        # positions shifted under us -- re-derive done_pos/
+                        # start_pos and rescan this window fresh next iteration.
+                        continue
 
-            cost = _resolve_inst_cost(candidate, comp_by_name)
-            prev_deficit = window["deficit"]
-            window["deficit"] = max(0.0, window["deficit"] - cost)
-            _logger.info(
-                "collective_overlap_pass [%s]: relocated heavy compute %s "
-                "(cost %.1f us) into exposed window of %s (window deficit "
-                "%.1f -> %.1f us).",
-                module_name, candidate.name, cost, window["start"].name,
-                prev_deficit, window["deficit"],
-            )
+                    if legal_candidates:
+                        def _lands_in_sibling(floor: int) -> bool:
+                            return any(s <= floor < d for s, d in window_siblings)
 
+                        remaining = window["deficit"]
+                        sufficient = [c for c in legal_candidates if c[3] >= remaining]
+                        if sufficient:
+                            # Smallest candidate that still fully closes the
+                            # deficit (minimizes overshoot/waste), preferring
+                            # one that also lands inside a sibling window's
+                            # range so one relocation counts toward both.
+                            candidate, cand_floor, cand_chain, _ = min(
+                                sufficient,
+                                key=lambda c: (not _lands_in_sibling(c[1]), c[3]),
+                            )
+                        else:
+                            # Nothing alone reaches the deficit -- take the
+                            # largest available, same sibling preference.
+                            candidate, cand_floor, cand_chain, _ = max(
+                                legal_candidates,
+                                key=lambda c: (_lands_in_sibling(c[1]), c[3]),
+                            )
+
+                if candidate is None:
+                    break
+
+                target = max(cand_floor, start_pos + 1)
+                to_move_set = set(cand_chain) | {candidate}
+                new_seq = [inst for inst in seq if inst not in to_move_set]
+                ins_pos = target
+                for inst in cand_chain:  # already in topological (schedule) order
+                    new_seq.insert(ins_pos, inst)
+                    ins_pos += 1
+                new_seq.insert(ins_pos, candidate)
+                schedule.set_sequence(comp, new_seq)
+                seq = new_seq
+                positions = {inst: i for i, inst in enumerate(seq)}
+                name_to_pos = {inst.name: i for inst, i in positions.items()}
+                changed = True
+                pass_changed = True
+
+                cost = _resolve_inst_cost(candidate, comp_by_name)
+                prev_deficit = window["deficit"]
+                # Not claiming a post-relocation deficit here: a naive
+                # "deficit -= cost" can double-credit a candidate displaced
+                # and re-placed within the same loop (see top-of-loop
+                # recompute above). Next iteration's recompute is the
+                # authoritative post-relocation figure.
+                _logger.info(
+                    "collective_overlap_pass [%s]: relocated heavy compute %s "
+                    "(cost %.1f us) into exposed window of %s (pre-relocation "
+                    "deficit was %.1f us; see next deficit= line for the real "
+                    "post-relocation figure).",
+                    module_name, candidate.name, cost, window["start"].name,
+                    prev_deficit,
+                )
+        if not pass_changed:
+            break
     return changed, seq, positions, name_to_pos
 
 
@@ -1967,14 +2349,11 @@ def _innermost_first_computations(module, schedule) -> list:
     # compare equal even for the same underlying computation).
     local_comp_by_name = {c.name: c for c in all_comps}
 
-    # Build a map of computation → set of while-body children.
-    # Simultaneously collect the set of all while-body callees so we can
-    # identify the root (entry) computation as the one with no callers.
-    #
-    # inst.opcode is a jaxlib._hlo.HloOpcode enum (not a string) and
-    # HloInstruction has no called_computations() accessor, so both the
-    # opcode check and the callee lookup go through _opcode_str()/to_string()
-    # parsing instead of direct attribute access.
+    # Build computation -> while-body children, and the set of all
+    # while-body callees (the entry computation is the one with no callers).
+    # inst.opcode is a jaxlib._hlo.HloOpcode enum and HloInstruction has no
+    # called_computations() accessor, so both checks go through
+    # _opcode_str()/to_string() parsing instead of direct attribute access.
     children: dict = {c: [] for c in all_comps}
     all_callees: set = set()
     for comp in all_comps:
@@ -2080,11 +2459,127 @@ def _log_profile_coverage_gaps(module, schedule, module_name: str) -> None:
         )
 
 
+def _fill_exposed_collectives_best_of(
+    seq: list,
+    schedule,
+    comp,
+    start_of_done: dict,
+    positions: dict,
+    name_to_pos: dict,
+    comp_by_name: dict,
+    module_name: str,
+) -> tuple[bool, list, dict, dict]:
+    """Try every _GIVE_UP_MODES strategy for
+    _fill_exposed_collectives_with_heavy_compute against this computation,
+    each starting from the same baseline schedule, and keep whichever
+    produces the lowest real total exposed time (_total_exposed_us) across
+    this computation's own collectives.
+
+    No single give-up strategy dominated across every computation observed
+    in practice: for the small while-loop-body computations (a handful of
+    call-start windows sharing a scarce, mostly-unreachable pool of heavy
+    compute -- see the dot_product_attention_fwd.33.double_buffer_clone
+    investigation), "streak" won by a wide margin (job 3184713). For the
+    much larger ENTRY computation, "floor_aware" recovered significantly
+    more of the fixed-point loop's improvement (job 3187886) because it
+    doesn't prematurely abandon candidates whose multi-hop chains take more
+    than a few hops to genuinely converge. Rather than pick one heuristic
+    and accept whichever trade-off it implies everywhere, just measure and
+    keep the best per computation -- this is cheap to do since each
+    computation is scheduled independently anyway.
+
+    Costs roughly len(_GIVE_UP_MODES)x the compute of a single strategy for
+    this comp's fill step specifically (not the whole pass) -- acceptable
+    as a one-time cost, but _run_phase1_to_fixed_point re-enters
+    _phase1_reorder (and so this function, once per computation) up to
+    _MAX_PHASE1_FIXED_POINT_ITERS times per _compute_collective_overlap
+    call, and re-running the full comparison every single time compounded
+    into a job timeout in practice (3188145). So the winning mode is cached
+    per computation name (_fill_strategy_cache) after the first comparison
+    within a _run_phase1_to_fixed_point call, and subsequent re-entries for
+    the same computation just replay that cached strategy with a single
+    trial instead of re-comparing all of them from scratch.
+    """
+    global _fill_strategy_cache
+    cached_mode = _fill_strategy_cache.get(comp.name)
+    if cached_mode is not None:
+        # Log _total_exposed_us on the cached path too (not just the first,
+        # full-comparison call) -- otherwise every re-entry after the first
+        # for this comp goes dark, and drift from later schedule.update()/
+        # verify() calls (well-documented elsewhere in this file -- see
+        # _run_phase1_to_fixed_point's docstring) between _phase1_reorder
+        # re-entries becomes invisible instead of a visible trajectory.
+        pre_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
+        changed, seq, positions, name_to_pos = _fill_exposed_collectives_with_heavy_compute(
+            list(seq), schedule, comp, start_of_done, dict(positions), dict(name_to_pos),
+            comp_by_name, module_name, give_up_mode=cached_mode,
+        )
+        post_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
+        _logger.info(
+            "collective_overlap_pass [%s]: comp %s: cached fill strategy "
+            "'%s' re-applied -- total exposed on entry %.1f us -> %.1f us "
+            "after this re-entry's fill (changed=%s).",
+            module_name, comp.name, cached_mode, pre_total, post_total, changed,
+        )
+        return changed, seq, positions, name_to_pos
+
+    baseline_seq = list(seq)
+    baseline_positions = dict(positions)
+    baseline_name_to_pos = dict(name_to_pos)
+
+    best = None  # (total_exposed, changed, seq, positions, name_to_pos, mode)
+    for mode in _GIVE_UP_MODES:
+        schedule.set_sequence(comp, list(baseline_seq))
+        trial_changed, trial_seq, trial_positions, trial_name_to_pos = (
+            _fill_exposed_collectives_with_heavy_compute(
+                list(baseline_seq), schedule, comp, start_of_done,
+                dict(baseline_positions), dict(baseline_name_to_pos),
+                comp_by_name, module_name, give_up_mode=mode,
+            )
+        )
+        total = _total_exposed_us(start_of_done, trial_positions, trial_seq, comp_by_name)
+        _logger.info(
+            "collective_overlap_pass [%s]: fill strategy '%s' for comp %s: "
+            "total exposed %.1f us (changed=%s).",
+            module_name, mode, comp.name, total, trial_changed,
+        )
+        if best is None or total < best[0] - 1e-6:
+            best = (total, trial_changed, trial_seq, trial_positions, trial_name_to_pos, mode)
+
+    total, changed, seq, positions, name_to_pos, mode = best
+    schedule.set_sequence(comp, seq)
+    _fill_strategy_cache[comp.name] = mode
+    _logger.info(
+        "collective_overlap_pass [%s]: comp %s: selected fill strategy "
+        "'%s' (total exposed %.1f us).",
+        module_name, comp.name, mode, total,
+    )
+    # A per-window retry of stuck windows (e.g. all-gather-start.8.g0/.g3
+    # under 'none', job 3191924) with the other give_up modes was tried and
+    # reverted (job 3193061): every alternate mode converged to the exact
+    # same deficit. Root cause: te_gemm_v2_ffi.81/.87 (dot_product_attention
+    # _fwd.10's direct producers) both take all-gather-done.8.g2 as an
+    # operand, a real data-dependency floor no give_up policy can move. This
+    # is a consequence of how phase 2's split grouped all-gather-start.8's
+    # operands into g0-g3, not a fill-algorithm gap -- would need a
+    # different split partitioning to address.
+    return changed, seq, positions, name_to_pos
+
+
 # DIAGNOSTIC (temporary): module-wide accumulator of "already hidden"
 # verdicts, so _compute_collective_overlap can re-verify them again after
 # schedule.update()/module.set_schedule(), not just within the comp that
 # produced each verdict. Cleared at the top of each _phase1_reorder call.
 _diag_hidden_windows: list[dict] = []
+
+# Cache of which _GIVE_UP_MODES strategy won _fill_exposed_collectives_best_of's
+# comparison for a given computation, so the ~3x-cost multi-strategy trial
+# only runs once per computation per _run_phase1_to_fixed_point call instead
+# of on every re-entry into _phase1_reorder (re-comparing on every re-entry
+# caused a timeout -- job 3188145). Cleared at the top of
+# _run_phase1_to_fixed_point since profiled costs/positions can differ
+# across separate _compute_collective_overlap invocations.
+_fill_strategy_cache: dict[str, str] = {}
 
 
 def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
@@ -2203,72 +2698,11 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
             floor, to_move, blocker = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
             orig_ag_start_pos = ag_start_pos  # for the "moved from X to Y" log below
 
-            # ag_start's own trivial operand chain is pinned by a real
-            # (non-trivial) producer at `floor - 1`. That producer's CURRENT
-            # position isn't necessarily where it has to be, though -- it
-            # may itself be a movable heavy op (e.g. a GEMM) sitting well
-            # after its own real dependencies, with a bunch of causally
-            # unrelated compute scheduled in between (e.g. other layers'
-            # forward/backward work) that just happened to land there. Chase
-            # the blocking producer's own blocking producer, and so on,
-            # walking the operand chain all the way back toward the
-            # computation's true inputs -- not only when ag_start is fully
-            # stuck (floor >= ag_start_pos), but always, since even a small
-            # legal move for ag_start today can mask a much larger one
-            # available by relocating its blocker first.
-            #
-            # Each hop does NOT unconditionally relocate the blocker all the
-            # way to its own theoretical-earliest floor: pulling a heavy op
-            # out of its current spot can just as easily EXPOSE some other,
-            # already-hidden collective that was relying on it sitting
-            # there for that collective's own overlap. Instead,
-            # _try_relocate_blocker_earlier searches every legal position
-            # between the blocker's current spot and its floor for the one
-            # that minimizes TOTAL exposed time summed across every
-            # collective in this computation (via
-            # _find_best_blocker_position / _total_exposed_us), and only
-            # moves it there if that's a net improvement -- possibly
-            # stopping well short of the theoretical floor, or not moving
-            # at all. Each hop re-derives this fresh against the latest
-            # positions, so the chain is walked and re-optimized
-            # recursively until no further net-beneficial move exists.
-            # Bounded by _MAX_PRODUCER_RELOCATE_HOPS purely as a safety net
-            # against pathological chains, not as a design ceiling --
-            # normal chains terminate on their own the moment no candidate
-            # position helps (or the blocker is too cheap to bother with),
-            # which _try_relocate_blocker_earlier reports by returning
-            # None.
-            hops = 0
-            while (
-                _ENABLE_RECURSIVE_BLOCKER_CHASE
-                and blocker is not None
-                and hops < _MAX_PRODUCER_RELOCATE_HOPS
-            ):
-                result = _try_relocate_blocker_earlier(
-                    blocker, comp, schedule, seq, positions, name_to_pos, comp_by_name,
-                    ag_start, positions[ag_done], collective_latency, start_of_done,
-                    module_name,
-                )
-                if result is None:
-                    break
-                seq, positions, name_to_pos = result
-                changed = True
-                hops += 1
-                _logger.info(
-                    "collective_overlap_pass [%s]: relocated blocking producer %s "
-                    "earlier to unblock %s (hop %d).",
-                    module_name, blocker.name, ag_start.name, hops,
-                )
-                ag_start_pos = positions[ag_start]
-                floor, to_move, blocker = _earliest_legal_pos(
-                    ag_start, positions, name_to_pos, comp_by_name
-                )
-
             # ag_start's own trivial chain lands immediately before it, so
             # its actual post-move position is floor + len(to_move), not
             # floor itself -- comparing against the bare floor would treat
-            # an already-optimally-packed ag_start (no gap between it and
-            # its chain) as movable and perform a no-op "move".
+            # an already-optimally-packed ag_start (no gap before it) as
+            # movable and perform a no-op "move".
             if floor + len(to_move) >= ag_start_pos:
                 _logger.debug(
                     "collective_overlap_pass [%s]: %s cannot move "
@@ -2339,7 +2773,7 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                         total_latency_us=collective_latency,
                     ))
 
-        heavy_changed, seq, positions, name_to_pos = _fill_exposed_collectives_with_heavy_compute(
+        heavy_changed, seq, positions, name_to_pos = _fill_exposed_collectives_best_of(
             seq, schedule, comp, start_of_done, positions, name_to_pos, comp_by_name, module_name,
         )
         if heavy_changed:
@@ -2371,12 +2805,10 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
 
         # DIAGNOSTIC (temporary): re-check every "already hidden" verdict
         # from this comp against the final seq/positions, since neither the
-        # per-collective loop nor the fill step above ever revisits it.
-        # Investigating a case (job 3159101, all-gather-start.9) where the
-        # instructions that justified "already hidden" ended up outside the
-        # window in the module actually handed back to XLA, despite no
-        # relocation log line ever naming them -- see if this flags it and
-        # pinpoints what moved.
+        # per-collective loop nor the fill step above ever revisits it (job
+        # 3159101 saw an "already hidden" collective end up outside its
+        # window in the final module with no relocation log line to explain
+        # it).
         for snap in already_hidden_snapshot:
             ag_start = snap["ag_start"]
             ag_done = snap["ag_done"]
@@ -2550,16 +2982,13 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
     sched_ids = list(proto.schedule.sequences[entry_comp.id].instruction_ids)
     id_to_sched_pos = {iid: pos for pos, iid in enumerate(sched_ids)}
 
-    # ID allocators
-    #
+    # ID allocators.
     # Instruction IDs are packed as (computation_unique_id << 32) | local_id.
-    # CalculateLocalId = id & 0xFFFFFFFF, used as key in each computation's
-    # instruction_map.  Allocating simply from global_max+1 picks a value whose
-    # lower 32 bits may equal an existing local_id in entry_comp → collision.
-    #
-    # Fix: for new instructions in entry_comp, use entry_comp's own parent bits
-    # and a local_id above the current max in entry_comp.  For new async
-    # computations, use their own comp id as the parent bits, starting at 0.
+    # Allocating simply from global_max+1 picks a value whose lower 32 bits
+    # may equal an existing local_id in entry_comp -> collision. Instead:
+    # new instructions in entry_comp get entry_comp's own parent bits and a
+    # local_id above its current max; new async computations use their own
+    # comp id as the parent bits, starting at 0.
     _MASK32 = 0xFFFFFFFF
     _entry_parent_bits = entry_comp.id << 32
     _max_entry_local = max(
@@ -2686,6 +3115,27 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             )
             continue
 
+        # Per-operand byte sizes, used below to estimate each new
+        # sub-collective's own latency as its share of the original
+        # collective's PGLE-measured total_latency_us, weighted by bytes
+        # transferred rather than splitting evenly across groups. Without
+        # this, the post-split _phase1_reorder re-run has no PGLE entry for
+        # any new sub-collective and silently skips them -- see
+        # _SplitCandidate.total_latency_us.
+        #
+        # A byte-share-based "skip the split if a group looks too small"
+        # heuristic was tried to guard against the downstream-consumer
+        # imbalance that starved all-gather-start.8.g0/.g3 (jobs
+        # 3191924/3193061) and was reverted: byte share doesn't predict
+        # downstream consumer count -- g2 (7 dependent GEMMs) had the
+        # *smallest* byte share (0.19x even split) while g0 (1 dependent
+        # GEMM, the actual problem) had a roughly-average share (0.91x).
+        _operand_bytes = [
+            _proto_shape_bytes(id_to_inst[start_inst.operand_ids[i]].shape)
+            for i in range(n_operands)
+        ]
+        _total_operand_bytes = sum(_operand_bytes) or 1
+
         epoch_summaries = [
             f"g{i}:{len(g)}ops@pos{max(cand.effective_producer_pos[j] for j in g)}"
             for i, g in enumerate(groups)
@@ -2695,21 +3145,6 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             "into %d groups: %s",
             cand.start_name, cand.deficit_us, len(groups), epoch_summaries,
         )
-
-        # Per-operand byte sizes, used below to estimate each new
-        # sub-collective's own latency as its share of the original
-        # collective's PGLE-measured total_latency_us, weighted by bytes
-        # transferred (the physically-motivated proxy for collective
-        # runtime) rather than splitting the latency evenly across groups.
-        # Without this, the post-split _phase1_reorder re-run has no PGLE
-        # entry for any new sub-collective (they didn't exist when
-        # profiling ran) and silently skips them entirely -- see
-        # _SplitCandidate.total_latency_us.
-        _operand_bytes = [
-            _proto_shape_bytes(id_to_inst[start_inst.operand_ids[i]].shape)
-            for i in range(n_operands)
-        ]
-        _total_operand_bytes = sum(_operand_bytes) or 1
 
         # --- For each group, build a sub-collective ---
         # new_pairs: (group_indices, new_start_id, new_done_id,
@@ -2742,31 +3177,26 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
                         _seen_gte_ids.add(next_id)
                     cur_id = next_id
                 group_op_ids.extend(reversed(intermediates))
-                # op_id itself only needs relocating when it is itself a
-                # zero-cost op (bitcast/GTE/tuple) directly feeding the
-                # collective-start — those must move together with the rest
-                # of the chain so the sub-start's operands stay contiguous.
-                # If op_id is instead the real (non-zero-cost) producer
-                # (e.g. a GEMM feeding the collective with no zero-cost
-                # wrapper), it must NOT be relocated: (1) moving a heavy
-                # compute instruction can violate other consumers' ordering,
-                # and (2) _proto_effective_pos(op_id) returns op_id's own
-                # schedule position as eff_pos, and removing op_id from the
-                # schedule invalidates that position in orig_to_compact,
-                # which then silently falls back to the raw (pre-removal)
-                # index — overshooting the true compact position badly
-                # enough that the sub-done can end up inserted before its
-                # own sub-start (RET_CHECK at hlo_schedule.cc:456).
+                # op_id itself only needs relocating when it is a zero-cost
+                # op (bitcast/GTE/tuple) directly feeding the
+                # collective-start -- it must move with the rest of the
+                # chain so the sub-start's operands stay contiguous. If
+                # op_id is the real (non-zero-cost) producer instead (e.g. a
+                # GEMM with no zero-cost wrapper), it must NOT be relocated:
+                # moving heavy compute can violate other consumers'
+                # ordering, and removing op_id from the schedule invalidates
+                # its cached position in orig_to_compact, which silently
+                # falls back to the raw pre-removal index -- overshooting
+                # the true compact position badly enough that the sub-done
+                # can end up inserted before its own sub-start (RET_CHECK at
+                # hlo_schedule.cc:456).
                 #
-                # The dedup via _seen_gte_ids still applies: two different
-                # operand indices in this (or another) group can reference
-                # the exact same zero-cost instruction (e.g. a combined
-                # all-gather whose operand tuple repeats a buffer), or one
-                # operand's own op_id can turn out to be an ancestor
-                # discovered while walking a later operand's chain. Either
-                # way it must only be relocated once — inserting the same
-                # instruction into the schedule twice trips XLA's schedule
-                # verifier (hlo_schedule.cc:439).
+                # _seen_gte_ids dedup still applies: two operand indices can
+                # reference the same zero-cost instruction, or one operand's
+                # op_id can turn out to be an ancestor discovered while
+                # walking a later operand's chain -- either way it must
+                # only be relocated once, or XLA's schedule verifier trips
+                # on the duplicate insertion (hlo_schedule.cc:439).
                 _op_inst = id_to_inst.get(op_id)
                 if (_op_inst is not None and _op_inst.opcode in _ZERO_COST_OPS
                         and op_id not in _seen_gte_ids):
@@ -2817,18 +3247,17 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
             # rather than the legacy replica_groups field, which is then left
             # empty — copying only replica_groups silently drops the real
             # group, so the verifier falls back to inferring a full-device
-            # subgroup (e.g. 32) instead of the instruction's true, possibly
-            # smaller, subgroup (e.g. 8), tripping the shard_count ==
-            # subgroup_size RET_CHECK in hlo_verifier.cc.
+            # subgroup (e.g. 32) instead of the true, possibly smaller,
+            # subgroup (e.g. 8), tripping the shard_count == subgroup_size
+            # RET_CHECK in hlo_verifier.cc.
             nr.replica_groups.extend(inner_inst.replica_groups)
-            # The modern replacement for replica_groups is the
-            # "replica_group_list" oneof (collective_device_list /
-            # iota_collective_device_list / mesh_axes_replica_group_list —
-            # the latter is what Shardy-partitioned modules use). Whichever
-            # variant is set, the participating-device grouping is identical
-            # across all split sub-collectives (splitting only partitions
-            # the operand/buffer list, not who talks to whom), so copy it
-            # verbatim.
+            # The modern replacement is the "replica_group_list" oneof
+            # (collective_device_list / iota_collective_device_list /
+            # mesh_axes_replica_group_list, the latter for Shardy-partitioned
+            # modules). Whichever variant is set, the device grouping is
+            # identical across all split sub-collectives (splitting only
+            # partitions the operand/buffer list, not who talks to whom), so
+            # copy it verbatim.
             _which_dl = inner_inst.WhichOneof("replica_group_list")
             if _which_dl is not None:
                 getattr(nr, _which_dl).CopyFrom(getattr(inner_inst, _which_dl))
@@ -2953,14 +3382,12 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
                 _cidx += 1
 
         def _compact_pos_at_or_before(pos: int) -> int:
-            # eff_pos should always land on a surviving instruction, but as
-            # defense-in-depth (in case some other candidate/op ends up
-            # removed at that exact position), snap to the nearest
-            # surviving position at or before it rather than falling back
-            # to the raw pre-removal index — using the raw index directly
-            # can overshoot into (or past) compact positions reserved for
-            # later insertions, e.g. the sub-done block, and cause the
-            # RET_CHECK ordering violation seen in hlo_schedule.cc:456.
+            # eff_pos should land on a surviving instruction, but as
+            # defense-in-depth, snap to the nearest surviving position at
+            # or before it rather than the raw pre-removal index -- the raw
+            # index can overshoot into compact positions reserved for later
+            # insertions (e.g. the sub-done block) and trip the RET_CHECK
+            # ordering violation at hlo_schedule.cc:456.
             for _p in range(pos, -1, -1):
                 if _p in orig_to_compact:
                     return orig_to_compact[_p]
@@ -3228,15 +3655,76 @@ def _diag_recheck_hidden_windows(schedule, module_name: str, label: str) -> None
 
 
 # Cap on how many times we re-run _phase1_reorder against a freshly
-# schedule.update()'d module. See the loop in _compute_collective_overlap
-# for why this is needed at all: schedule.update()/verify() can silently
-# relocate an instruction whose true data dependency one of our own earlier
-# relocations invalidated elsewhere in the same comp, and that relocation
-# is invisible to _phase1_reorder's own seq/positions bookkeeping. Normal
-# runs converge in 1-2 iterations (the first iteration's relocations rarely
-# cascade into a second round of dependency violations); this is purely a
-# safety net against a pathological cascade never settling.
+# schedule.update()'d module (see _run_phase1_to_fixed_point's docstring).
+# Normal runs converge in 1-2 iterations; this is a safety net against a
+# pathological cascade never settling.
 _MAX_PHASE1_FIXED_POINT_ITERS = 4
+
+
+def _log_final_exposed_summary(module, schedule, module_name: str, label: str) -> None:
+    """Log the true total exposed time across every computation in `module`,
+    computed directly from `schedule`'s live state -- a ground-truth
+    measurement independent of intermediate _total_exposed_us values logged
+    during earlier steps, which can go stale after a later
+    schedule.update()/verify() (see _run_phase1_to_fixed_point's
+    docstring). Call immediately before serializing/returning the final
+    module.
+    """
+    comp_by_name = {c.name: c for c in module.computations()}
+    grand_total = 0.0
+    per_comp = []
+    per_collective = []  # (comp_name, collective_name, deficit_us)
+    for comp in module.make_nonfusion_computations():
+        seq = schedule.sequence(comp)
+        if seq is None:
+            continue
+        seq = list(seq)
+        positions = {inst: i for i, inst in enumerate(seq)}
+        start_of_done: dict = {}
+        for inst in seq:
+            if _is_async_start(inst):
+                users = list(inst.users())
+                if len(users) == 1:
+                    start_of_done[users[0]] = inst
+        if not start_of_done:
+            continue
+        total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
+        if total > 0:
+            per_comp.append((comp.name, total))
+        grand_total += total
+
+        prefix = _prefix_costs_excluding(seq, (), comp_by_name)
+        for ag_done, ag_start in start_of_done.items():
+            if ag_start not in positions or ag_done not in positions:
+                continue
+            profile_key = _resolve_profile_key(ag_start, comp_by_name)
+            latency = _profile_costs.get(profile_key)
+            if latency is None or latency <= 0:
+                continue
+            s, d = positions[ag_start], positions[ag_done]
+            overlap = prefix[d] - prefix[s + 1] if d > s + 1 else 0.0
+            deficit = max(0.0, latency - overlap)
+            if deficit > 0:
+                per_collective.append((comp.name, ag_start.name, deficit))
+    per_comp.sort(key=lambda x: -x[1])
+    per_collective.sort(key=lambda x: -x[2])
+    _logger.info(
+        "collective_overlap_pass [%s]: FINAL ground-truth exposed summary "
+        "[%s] (direct from schedule, right before serialization): "
+        "grand_total=%.1f us across %d computation(s) with nonzero "
+        "exposure: %s",
+        module_name, label, grand_total, len(per_comp),
+        ", ".join(f"{name}={total:.1f}us" for name, total in per_comp),
+    )
+    _logger.info(
+        "collective_overlap_pass [%s]: FINAL ground-truth per-collective "
+        "exposed breakdown [%s]: %s",
+        module_name, label,
+        ", ".join(
+            f"{comp_name}/{name}={deficit:.1f}us"
+            for comp_name, name, deficit in per_collective
+        ),
+    )
 
 
 def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
@@ -3248,22 +3736,16 @@ def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool
     relocations invalidated elsewhere in the same comp -- e.g. moving
     collective A can shift instruction X across collective B's done,
     without X itself ever being touched by name. That relocation is
-    invisible to _phase1_reorder (which only tracks its own seq/positions
-    bookkeeping, not what schedule.update() does afterward), so a window
-    _phase1_reorder scored "already hidden" can end up genuinely exposed by
-    the time schedule.update() finishes. Confirmed via the DIAG
-    instrumentation below on job 3161055: all-gather-start.9's window
-    (te_gemm_v2_ffi.93 et al.) was still intact immediately after
+    invisible to _phase1_reorder's own seq/positions bookkeeping, so a
+    window scored "already hidden" can end up genuinely exposed by the
+    time schedule.update() finishes. Confirmed on job 3161055:
+    all-gather-start.9's window was intact immediately after
     _phase1_reorder returned, and only vanished after
-    schedule.update()/verify()/set_schedule() -- because te_gemm_v2_ffi.93
-    has a real data dependency on all-gather-done.8 (a different
-    collective) that got invalidated in the same pass. Re-running
-    _phase1_reorder against the *post-update* schedule lets it notice the
-    now-genuinely-exposed window and re-fill it -- its forward candidate
-    scan can now also see instructions XLA's repair relocated to after the
-    window's `done` (e.g. dot_product_attention_fwd, previously invisible
-    to the scan because it started out scheduled before the collective's
-    own `start`).
+    schedule.update()/verify()/set_schedule(), because te_gemm_v2_ffi.93
+    has a real data dependency on all-gather-done.8 that got invalidated in
+    the same pass. Re-running _phase1_reorder against the *post-update*
+    schedule lets it notice the now-genuinely-exposed window and re-fill
+    it.
 
     Also used to re-optimize a module straight out of phase 2 (see
     _compute_collective_overlap): _phase2_split_core is pure proto surgery
@@ -3273,6 +3755,8 @@ def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool
     the newly created sub-collectives start out wherever the topological
     fixup happened to place them, not at their own earliest legal position.
     """
+    global _fill_strategy_cache
+    _fill_strategy_cache = {}
     changed = False
     split_candidates: list[_SplitCandidate] = []
     for _fp_iter in range(_MAX_PHASE1_FIXED_POINT_ITERS):
@@ -3292,10 +3776,39 @@ def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool
             f"fixed-point iter {_fp_iter}, after schedule.update()/verify()/set_schedule()",
         )
     else:
+        # Every completed iteration above ends with schedule.update()/
+        # verify()/set_schedule(), which can itself silently disturb
+        # dependencies and re-expose windows _phase1_reorder just finished
+        # filling (per this function's docstring). Normally the next
+        # iteration's _phase1_reorder call notices and repairs that -- but
+        # when the loop exhausts here instead of breaking, the most recent
+        # update()/verify() is never rechecked, so its disturbance goes
+        # unaddressed. Confirmed in job 3188746: the fill step's own
+        # measured ENTRY total converged to ~59750-59770us, but the actual
+        # final schedule measured ~155000us exposed across the module --
+        # run one more _phase1_reorder pass so the function never returns a
+        # schedule whose last mutation was an unverified update().
         _logger.warning(
             "collective_overlap_pass [%s]: phase 1 fixed point not reached "
-            "after %d iterations; proceeding with the current schedule.",
+            "after %d iterations; running one final _phase1_reorder pass "
+            "against the post-update schedule so it doesn't go unaddressed.",
             module_name, _MAX_PHASE1_FIXED_POINT_ITERS,
+        )
+        final_changed, split_candidates = _phase1_reorder(module, schedule, module_name)
+        if final_changed:
+            changed = True
+            # _phase1_reorder only mutates `schedule` directly via
+            # set_sequence -- it never itself calls
+            # update()/verify()/module.set_schedule() (that's this loop's
+            # job, same as every earlier iteration above). Without this,
+            # this final pass's relocations would never actually land in
+            # the module this function's caller serializes.
+            schedule.update()
+            schedule.verify()
+            module.set_schedule(schedule)
+        _diag_recheck_hidden_windows(
+            schedule, module_name,
+            "post-fixed-point-cap final _phase1_reorder pass",
         )
     return changed, split_candidates
 
@@ -3330,6 +3843,7 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
 
     # ---- Phase 1 ----
     changed, split_candidates = _run_phase1_to_fixed_point(module, schedule, module_name)
+    _log_final_exposed_summary(module, schedule, module_name, "post-phase-1, pre-phase-2")
 
     if changed:
         phase1_bytes = module.as_serialized_hlo_module_proto()
@@ -3378,9 +3892,13 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
                     )
                 if split_changed:
                     phase2_bytes = split_module.as_serialized_hlo_module_proto()
+                _log_final_exposed_summary(
+                    split_module, split_schedule, module_name, "post-phase-2 split_module"
+                )
             return _dump_final_module(module_name, phase2_bytes)
 
     if changed:
+        _log_final_exposed_summary(module, schedule, module_name, "phase-1-only module")
         return _dump_final_module(module_name, phase1_bytes)
     return None
 
@@ -3484,15 +4002,12 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
     client = _get_distributed_client()
     _in_rank = _jax_process_id() if client is not None else 0
 
-    # Content-identity for this invocation -- diagnostic only (see
-    # PRE-PASS INPUT HASH below), NOT used as the KV-share/barrier key
-    # (see the docstring for why content-hashing, of either the raw
-    # serialized_hlo bytes or this module.to_string() text, proved
-    # unreliable for that and was replaced with the call-order-based
-    # _barrier_invocation_count). Still useful here as a quick way to spot,
-    # by eye or by `grep PRE-PASS INPUT HASH`, whether two ranks' modules
-    # for the same invocation actually match or not, and if not, to diff
-    # the accompanying text dumps to see exactly what differs.
+    # Content-identity for this invocation -- diagnostic only, NOT used as
+    # the KV-share/barrier key (content-hashing proved unreliable for that
+    # and was replaced with the call-order-based _barrier_invocation_count;
+    # see this function's docstring). Useful here as a quick way to spot,
+    # by eye or `grep PRE-PASS INPUT HASH`, whether two ranks' modules for
+    # the same invocation actually match, and if not, diff the text dumps.
     import hashlib as _hashlib  # pylint: disable=import-outside-toplevel
     _module_text = module.to_string()
     _content_digest = _hashlib.sha256(_module_text.encode()).hexdigest()
@@ -3718,17 +4233,13 @@ def _patch_pgle_profiler() -> None:
 
     # Also intercept the raw per-retry XSpace bytes, one level upstream of
     # consume_fdo_profile: PGLEProfiler.trace() calls
-    # _profiler.get_fdo_profile(xspace) on each profiling retry's raw XSpace
-    # and only keeps the (lossy, per-kernel-mean -- see
-    # _load_te_ep_costs_from_xspace_bytes) converted result, discarding
-    # xspace itself once this call returns. Wrapping get_fdo_profile lets us
-    # compute correct te_ep_* costs from that same raw xspace before it's
-    # gone, live within this run's own PGLE profiling retries -- no
-    # reference trace or separate bootstrapping run needed. Global
-    # _te_ep_overrides_loaded is set here too so _apply_te_ep_cost_overrides
-    # (the reference-trace fallback, triggered later from _update_profile)
-    # skips its own load once live data is already in hand -- live data
-    # from this exact run is always preferable to a prior run's trace.
+    # _profiler.get_fdo_profile(xspace) on each retry's raw XSpace and
+    # discards xspace once it returns. Wrapping get_fdo_profile lets us
+    # compute correct te_ep_* costs from that raw xspace before it's gone,
+    # live within this run's own PGLE retries -- no reference trace needed.
+    # _te_ep_overrides_loaded is set here too so
+    # _apply_te_ep_cost_overrides (the reference-trace fallback) skips its
+    # own load once live data is already in hand.
     global _te_ep_overrides_loaded
     _original_get_fdo_profile = _jax_profiler._profiler.get_fdo_profile
 
@@ -3762,17 +4273,13 @@ def _patch_pgle_profiler() -> None:
 # ---------------------------------------------------------------------------
 def register() -> None:
     """Register the collective-overlap POST_SCHEDULER pass and PGLE hook."""
-    # A hang inside XLA's own C++ compiler (as opposed to inside this
-    # pass's Python code) leaves no further log lines and is invisible to
-    # gdb/py-spy from outside the container (mount/pid namespace entry via
-    # nsenter/enroot exec requires privileges we don't have on this
-    # cluster). faulthandler sidesteps all of that: it writes directly to
-    # this process's own stderr (captured in its output-*.txt like
-    # everything else) on receipt of a signal, so diagnosing a hang is just
-    # `kill -USR1 <pid>` from any session that can see the pid (e.g. `srun
-    # --overlap --jobid=<job> -w <host> kill -USR1 <pid>`, no namespace
-    # entry needed) using the rank/host/pid already logged by every
-    # "... rank=%d host=%s pid=%d ..." line in this module.
+    # A hang inside XLA's own C++ compiler leaves no log lines and is
+    # invisible to gdb/py-spy from outside the container (namespace entry
+    # requires privileges we don't have on this cluster). faulthandler
+    # sidesteps that: it writes directly to this process's own stderr on
+    # receipt of a signal, so diagnosing a hang is just `kill -USR1 <pid>`
+    # (e.g. `srun --overlap --jobid=<job> -w <host> kill -USR1 <pid>`)
+    # using the rank/host/pid logged by this module's own log lines.
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     _logger.info(
         "collective_overlap_pass: registered SIGUSR1 handler (faulthandler, "
