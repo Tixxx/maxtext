@@ -502,6 +502,38 @@ _SPLIT_DEFICIT_THRESHOLD_US = (
     float("inf") if os.environ.get("COLLECTIVE_OVERLAP_DISABLE_SPLIT") == "1"
     else 500.0
 )
+
+# Set COLLECTIVE_OVERLAP_WHILE_BODY_ONLY=1 to skip phase-1 reorder/fill (and
+# therefore phase-2 split, which only ever runs on collectives phase-1
+# actually queued as split candidates) entirely for the module's true entry
+# computation, processing only while-loop body computations. The entry
+# computation (e.g. `main`) is by far the largest sequence in a full-scale
+# module and dominates compile time -- the candidate scan in
+# _fill_exposed_collectives_with_heavy_compute is O(len(seq) - done_pos) per
+# while-loop iteration with no bound on window width, and deep chase chains
+# (dozens of hops seen in practice on `main`, e.g. job 3204127's 20-minute
+# timeout) multiply that by however many hops fire. While-loop bodies are
+# orders of magnitude shorter, so this knob trades away entry-computation
+# overlap entirely for a much faster compile when iterating.
+_WHILE_BODY_ONLY = os.environ.get("COLLECTIVE_OVERLAP_WHILE_BODY_ONLY") == "1"
+# Set COLLECTIVE_OVERLAP_HOIST_FSDP_STARTS=0 to disable the final per-while-body
+# step that moves every FSDP all-gather/reduce-scatter start (plus its trivial
+# operand chain, after hoisting any control-predecessors pinning it) to
+# its earliest legal position regardless of deficit.
+_HOIST_FSDP_STARTS = os.environ.get("COLLECTIVE_OVERLAP_HOIST_FSDP_STARTS", "1") != "0"
+# Set COLLECTIVE_OVERLAP_HOIST_ASYNC_DONE_GUARD=1 to refuse hoisting an async-done
+# predecessor when that would shrink its own start's window below its profiled
+# latency. Off by default: in job 3212382 this guard refused fusion-done.16/.4
+# (small async stash fusions) 22 times, which kept every FSDP collective after
+# them pinned late.
+_HOIST_ASYNC_DONE_GUARD = os.environ.get("COLLECTIVE_OVERLAP_HOIST_ASYNC_DONE_GUARD", "0") == "1"
+# Set COLLECTIVE_OVERLAP_FSDP_TE_EP_AWARE=0 to disable te_ep-aware placement of FSDP
+# starts in the hoist step (see _fsdp_te_ep_defer_target).
+_FSDP_TE_EP_AWARE = os.environ.get("COLLECTIVE_OVERLAP_FSDP_TE_EP_AWARE", "0") == "1"
+# Set COLLECTIVE_OVERLAP_FSDP_STREAM_MODEL=0 to disable the communication-stream
+# model used to place FSDP starts/dones in the hoist step (see
+# _best_fsdp_placement). When on, it supersedes the te_ep-aware heuristic above.
+_FSDP_STREAM_MODEL = os.environ.get("COLLECTIVE_OVERLAP_FSDP_STREAM_MODEL", "1") != "0"
 # Instruction-name prefixes _phase2_split_core actually knows how to split:
 # a plain batched collective custom-call with multiple tuple operands
 # directly on the async-start. Other async-start-wrapped ops (e.g.
@@ -863,12 +895,8 @@ def _unwrap_to_leaf_name(inst, comp_by_name: dict) -> str:
     we don't force our way past it. Bounded by _MAX_PROFILE_KEY_UNWRAP_HOPS
     purely as a safety net against unexpectedly deep or cyclic call chains.
     """
-    for hop in range(_MAX_PROFILE_KEY_UNWRAP_HOPS):
+    for _hop in range(_MAX_PROFILE_KEY_UNWRAP_HOPS):
         opc = _opcode_str(inst)
-        _logger.debug(
-            "collective_overlap_pass: _unwrap_to_leaf_name hop %d: %s(%s).",
-            hop, inst.name, opc,
-        )
         if opc not in ("call", "call-start", "async-start"):
             return inst.name
         try:
@@ -937,6 +965,105 @@ def _resolve_profile_key(ag_start, comp_by_name: dict) -> str:
     return _unwrap_to_leaf_name(root, comp_by_name)
 
 
+def _is_te_ep_call_start(inst, comp_by_name: dict) -> bool:
+    """True if inst is an async-start (call-start) whose resolved profile
+    key (see _resolve_profile_key) is a te_ep_combine_ffi/te_ep_dispatch_ffi
+    leaf -- i.e. one of the big MoE expert-parallel dispatch/combine
+    windows (multi-ms latency, see the region_20 call-start.54/56/59/64/67/
+    69 investigation earlier this session)."""
+    if not _is_async_start(inst):
+        return False
+    return _resolve_profile_key(inst, comp_by_name).startswith(("te_ep_combine", "te_ep_dispatch"))
+
+
+def _relocate_fsdp_done_before_te_ep(
+    ag_start, ag_done, comp, schedule, seq: list, positions: dict,
+    name_to_pos: dict, comp_by_name: dict, collective_latency: float,
+    module_name: str = "",
+):
+    """For an FSDP collective that's already fully hidden (real overlap >=
+    its own latency), pull its `done` instruction forward to the earliest
+    point that's still fully hidden AND immediately before a te_ep
+    dispatch/combine call-start, if one exists in that range.
+
+    `done`'s program-order position is what legally gates every instruction
+    that consumes the collective's result (a bitcast/GTE reading
+    all-gather-done.N's output, and transitively anything downstream of
+    that) -- it can sit anywhere strictly after `start` and still be
+    correct, completely independent of how much real slack the window has
+    beyond what's needed to hide the latency. Left wherever phase-1's own
+    (start-only) relocation happens to leave it, `done` often ends up with
+    a lot of unnecessary slack after the point the collective is actually
+    hidden -- during which none of its real downstream consumers are even
+    legally schedulable yet, even though the real data transfer is already
+    done in every way that matters. Moving `done` up to right where the
+    latency is hidden (and no further -- going earlier than that would
+    newly expose the collective, the opposite of the goal) frees those
+    consumers to become fill candidates for whatever's scheduled between
+    the new and old `done` position -- specifically targeting the point
+    just before a te_ep call-start, since those are the largest, hardest-
+    to-fill windows in this model (multi-ms each) and most starved for
+    legally-reachable heavy-compute candidates.
+
+    Always legal regardless of how far forward `done` moves (down to the
+    latency-closure point): `done`'s only real operand is `start` itself,
+    so moving it anywhere after `start` can never violate a data
+    dependency; its own consumers already sit after its *old* position by
+    construction, so they stay after its new (earlier) position too.
+    Control-predecessors (rare for an async-done) are still respected via
+    `_control_predecessor_names`.
+
+    Returns (changed, seq, positions, name_to_pos).
+    """
+    start_pos = positions[ag_start]
+    done_pos = positions[ag_done]
+    if done_pos <= start_pos + 1:
+        return False, seq, positions, name_to_pos
+
+    done_floor = start_pos + 1
+    for name in _control_predecessor_names(ag_done):
+        cp_pos = name_to_pos.get(name)
+        if cp_pos is not None and cp_pos + 1 > done_floor:
+            done_floor = cp_pos + 1
+
+    cum = 0.0
+    latency_closure_pos = None
+    for i in range(start_pos + 1, done_pos):
+        cum += _resolve_inst_cost(seq[i], comp_by_name)
+        if cum >= collective_latency:
+            latency_closure_pos = i + 1
+            break
+    if latency_closure_pos is None:
+        return False, seq, positions, name_to_pos
+
+    search_start = max(latency_closure_pos, done_floor)
+    target = None
+    for i in range(search_start, done_pos):
+        inst = seq[i]
+        if inst is ag_done or inst is ag_start:
+            continue
+        if _is_te_ep_call_start(inst, comp_by_name):
+            target = i
+            break
+    if target is None:
+        return False, seq, positions, name_to_pos
+
+    new_seq = [inst for inst in seq if inst is not ag_done]
+    new_seq.insert(target, ag_done)
+    schedule.set_sequence(comp, new_seq)
+    new_positions = {inst: i for i, inst in enumerate(new_seq)}
+    new_name_to_pos = {inst.name: i for inst, i in new_positions.items()}
+    _logger.info(
+        "collective_overlap_pass [%s]: moved %s done from pos %d to %d, "
+        "right before te_ep call-start %s -- still fully hidden (latency "
+        "%.1f us closed by pos %d), frees downstream consumers to help "
+        "fill te_ep windows.",
+        module_name, ag_done.name, done_pos, target, seq[target].name,
+        collective_latency, latency_closure_pos,
+    )
+    return True, new_seq, new_positions, new_name_to_pos
+
+
 _MAX_RELOCATE_CHAIN = 64
 
 # Minimum profiled cost (us) for a non-trivial instruction to be considered
@@ -992,14 +1119,60 @@ def _is_te_gemm_custom_call(inst, comp_by_name: dict) -> bool:
 
 _FSDP_COLLECTIVE_PREFIXES = ("all-gather", "reduce-scatter")
 
+_HEAVY_ANCHOR_TARGET_RE = re.compile(
+    r'custom_call_target="(te_grouped_gemm[^"]*|te_gemm[^"]*|[^"]*cudnn[^"]*|[^"]*cublas[^"]*)"'
+)
+
+
+def _is_heavy_anchor_custom_call(inst, comp_by_name: dict) -> bool:
+    """True if inst is a custom-call (or a kind=kCustom fusion wrapping one,
+    same unwrap as _is_te_gemm_custom_call) to te_grouped_gemm/te_gemm/cudnn/
+    cublas -- the specific set of kernels _chase_ag_start_blocker_toward_
+    heavy_compute treats as a "good enough, stop chasing" landing anchor for
+    an FSDP collective's own blocker chain. Broader than
+    _is_te_gemm_custom_call (which only prioritizes te_gemm/te_grouped_gemm
+    for fill-candidate selection) -- kept as a separate function/regex so
+    this new, less-validated chase path doesn't silently change the
+    existing, already-validated FSDP fill-priority behavior.
+    """
+    opc = _opcode_str(inst)
+    try:
+        text = inst.to_string()
+    except Exception:
+        return False
+    if opc == "custom-call":
+        return bool(_HEAVY_ANCHOR_TARGET_RE.search(text))
+    if opc == "fusion" and "kind=kCustom" in text:
+        m = _CALLS_RE.search(text)
+        if not m:
+            return False
+        comp = comp_by_name.get(m.group(1))
+        if comp is None:
+            return False
+        try:
+            for sub in comp.instructions():
+                if _opcode_str(sub) != "custom-call":
+                    continue
+                if _HEAVY_ANCHOR_TARGET_RE.search(sub.to_string()):
+                    return True
+        except Exception:
+            return False
+        return False
+    return False
+
 
 def _earliest_legal_pos(
     ag_start,
     positions: dict,
     name_to_pos: dict,
     comp_by_name: dict,
+    cp_pins: Optional[list] = None,
 ) -> tuple[int, list, object]:
     """Compute the earliest position ag_start can legally be relocated to.
+
+    If cp_pins is a list, it is filled with (position, name) for every
+    control-predecessor outside the moving set (callers use it to find which
+    one pins the floor).
 
     Walks ag_start's operands transitively through trivially-movable
     instructions (bitcast/reshape/elementwise ops, trivial fusions, etc.) —
@@ -1052,6 +1225,8 @@ def _earliest_legal_pos(
             if name in moving_names:
                 continue
             cp_pos = name_to_pos.get(name)
+            if cp_pos is not None and cp_pins is not None:
+                cp_pins.append((cp_pos, name))
             if cp_pos is not None and cp_pos + 1 > floor:
                 floor = cp_pos + 1
                 blocker = None  # a control-predecessor, not a relocatable data producer
@@ -1470,6 +1645,104 @@ def _try_relocate_blocker_earlier(
     return new_seq, new_positions, new_name_to_pos
 
 
+def _chase_ag_start_blocker_toward_heavy_compute(
+    ag_start,
+    comp,
+    schedule,
+    seq: list,
+    positions: dict,
+    name_to_pos: dict,
+    comp_by_name: dict,
+    max_hops: int,
+    module_name: str = "",
+):
+    """FSDP-only: when ag_start itself has no legal earlier position because
+    its own direct (non-trivial) data producer -- the `blocker` from
+    _earliest_legal_pos -- sits right next to it, relocate that blocker
+    earlier too (unconditionally, same remove+reinsert move the rest of
+    this function's caller uses for ag_start itself -- no net-exposure or
+    margin check), repeating until either the blocker chain reaches a
+    recognized heavy-compute anchor (te_grouped_gemm/te_gemm/cudnn/cublas,
+    see _is_heavy_anchor_custom_call) or no further room exists.
+
+    _earliest_legal_pos only walks ag_start's *trivial* operand chain and
+    stops cold at the first non-trivial producer -- it never asks whether
+    that producer itself has room to move. So "cannot move" can be
+    misleading: an unrelated, genuinely heavy instruction (e.g. a GEMM)
+    with zero data dependency on ag_start can sit even further back in the
+    schedule, structurally reachable, while ag_start stays stuck because
+    nothing ever tried moving its own producer out of the way. Confirmed in
+    practice: all-gather-start.8.g0 in region_7.19_spmd.clone.1 (job
+    3204236) reported "cannot move" with its direct producers
+    (te_dbias_quantize_ffi.810/.825/.828/.819) pinning the floor, while
+    te_grouped_gemm_ffi.96.double_buffer_clone -- no data dependency on the
+    all-gather at all -- sat comfortably earlier in the same computation.
+
+    No safety gate (unlike _try_relocate_blocker_earlier, used by the other
+    chase functions in this file): an earlier version of this routed
+    through that function's net-exposure/margin-safe checks, but those
+    exist to stop a relocation from stealing overlap from some *other*
+    collective's window that currently depends on the relocated
+    instruction being where it is. For FSDP all-gather/reduce-scatter
+    collectives specifically, that risk is low in practice -- their direct
+    operand producers (quantize/dbias ops feeding the collective) are
+    narrow and specific to that one collective, not generally shared with
+    other collectives' overlap windows the way a general heavy-compute
+    candidate might be. Dropped deliberately for simplicity/speed; if
+    validation ever shows this regressing some other collective's
+    exposure, that's the signal the assumption doesn't hold and the gate
+    needs to come back.
+
+    Returns (changed, seq, positions, name_to_pos, floor, to_move, blocker)
+    -- floor/to_move/blocker are ag_start's current _earliest_legal_pos
+    result after however many hops fired, exactly like
+    _chase_heavy_compute_blocker_chain's return shape, so the caller can
+    immediately proceed with its own move-to-floor logic.
+    """
+    changed = False
+    floor, to_move, blocker = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
+    hops = 0
+    while (
+        blocker is not None
+        and not _is_heavy_anchor_custom_call(blocker, comp_by_name)
+        and hops < max_hops
+    ):
+        b_floor, b_chain, _ = _earliest_legal_pos(blocker, positions, name_to_pos, comp_by_name)
+        blocker_pos = positions[blocker]
+        final_pos = b_floor + len(b_chain)
+        if final_pos >= blocker_pos:
+            _logger.debug(
+                "collective_overlap_pass [%s]: CAB %s: blocker %s has no "
+                "room itself (own floor=%d + chain=%d = %d >= current "
+                "pos=%d) -- stopping chain.",
+                module_name, ag_start.name, blocker.name, b_floor,
+                len(b_chain), final_pos, blocker_pos,
+            )
+            break
+        to_move_set = set(b_chain) | {blocker}
+        new_seq = [inst for inst in seq if inst not in to_move_set]
+        ins_pos = b_floor
+        for inst in b_chain:  # already in topological (schedule) order
+            new_seq.insert(ins_pos, inst)
+            ins_pos += 1
+        new_seq.insert(ins_pos, blocker)
+        schedule.set_sequence(comp, new_seq)
+        seq = new_seq
+        positions = {inst: i for i, inst in enumerate(seq)}
+        name_to_pos = {inst.name: i for inst, i in positions.items()}
+        changed = True
+        hops += 1
+        prev_blocker = blocker
+        floor, to_move, blocker = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
+        _logger.debug(
+            "collective_overlap_pass [%s]: CAB %s: hop %d relocated %s "
+            "from pos %d to %d -- new floor=%d, next blocker=%s.",
+            module_name, ag_start.name, hops, prev_blocker.name, blocker_pos,
+            final_pos, floor, blocker.name if blocker is not None else None,
+        )
+    return changed, seq, positions, name_to_pos, floor, to_move, blocker
+
+
 def _chase_exposed_collective_blocker_earlier(
     blocker_done,
     start_of_done: dict,
@@ -1540,19 +1813,48 @@ def _chase_exposed_collective_blocker_earlier(
 
 def _find_relocatable_ancestor(
     inst, positions: dict, name_to_pos: dict, comp_by_name: dict, max_depth: int,
+    skip_cheap_ancestors: bool = False,
 ):
     """Walk `inst`'s own blocker chain until finding an ancestor with
     genuine *structural* room to move -- its own floor + trivial chain
     lands strictly before its current position -- as opposed to one that's
     already exactly as early as its own dependencies allow.
 
-    Purely structural: does not consider cost or net exposure at all, so
-    the returned instruction (if any) still MUST be run through
+    By default, purely structural: does not consider cost or net exposure
+    at all, so the returned instruction (if any) still MUST be run through
     _try_relocate_blocker_earlier's full gating before actually being
     moved. That gate -- unchanged, exactly as it already protects a
     single-hop chase -- is what refuses to disrupt an already-hidden
     collective; this function only ever decides *which* instruction to
     offer to that gate, never bypasses it.
+
+    skip_cheap_ancestors additionally requires cost >= _HEAVY_COMPUTE_MIN_US
+    before accepting an ancestor, skipping past trivial near-zero-cost
+    "connector" ops (dynamic-slice fusions, select fusions, a collective's
+    own call-start/done) that have structural room but would just get
+    refused by _try_relocate_blocker_earlier's own cost gate anyway --
+    without skipping them, the chase gives up on the whole chain the
+    instant it hits one, even with hop budget left and a genuinely heavy,
+    reachable candidate sitting further back (confirmed job 3202509).
+
+    Enabling this unconditionally measured net-negative overall (job
+    3203932 vs. 3202899, same config): 132 vs. 79 successful relocations
+    (confirming it does find more candidates) but the net total exposed
+    time still got WORSE (83724.4us vs. 72879.4us) -- almost entirely
+    concentrated in `main`, the computation with the deepest/longest chase
+    chains, even though a smaller while-loop computation (region_19)
+    clearly improved (11513.3us -> 5742.5us). Same root cause as why
+    `_ENABLE_RECURSIVE_BLOCKER_CHASE` is disabled (job 3150632):
+    `_find_best_blocker_position`'s net-benefit check is a per-hop
+    approximation that doesn't account for a later hop undoing an earlier
+    hop's "net win" assumption, so individually-positive moves can still
+    sum to a net-negative schedule -- more hops firing (exactly what this
+    flag causes) means more chances for that compounding error to
+    accumulate, and `main`'s much longer chase chains give it far more
+    opportunity to compound than a short while-loop body. So this is
+    scoped to while-body computations only (see `is_while_body` threaded
+    down from `_phase1_reorder`), where the same change measured a clear
+    net win in isolation.
 
     Returns the relocatable ancestor (possibly `inst` itself), or None if
     the chain bottoms out (no further blocker, a dependency cycle, or
@@ -1565,7 +1867,11 @@ def _find_relocatable_ancestor(
             return None
         seen.add(cur)
         floor, chain, sub_blocker = _earliest_legal_pos(cur, positions, name_to_pos, comp_by_name)
-        if floor + len(chain) < positions[cur]:
+        has_room = floor + len(chain) < positions[cur]
+        if has_room and (
+            not skip_cheap_ancestors
+            or _resolve_inst_cost(cur, comp_by_name) >= _HEAVY_COMPUTE_MIN_US
+        ):
             return cur
         cur = sub_blocker
     return None
@@ -1586,6 +1892,7 @@ def _chase_heavy_compute_blocker_chain(
     max_hops: int,
     module_name: str = "",
     position_margins: dict | None = None,
+    is_while_body: bool = False,
 ):
     """Repeatedly try to relocate whatever's currently blocking `candidate`
     from reaching a legal position inside window [ag_start, ag_done_pos),
@@ -1646,7 +1953,8 @@ def _chase_heavy_compute_blocker_chain(
     hops = 0
     while floor > ag_done_pos and blocker is not None and hops < max_hops:
         target = _find_relocatable_ancestor(
-            blocker, positions, name_to_pos, comp_by_name, max_hops - hops
+            blocker, positions, name_to_pos, comp_by_name, max_hops - hops,
+            skip_cheap_ancestors=is_while_body,
         )
         if target is None:
             _logger.debug(
@@ -1721,14 +2029,27 @@ def _chase_heavy_compute_blocker_chain(
 
 def _compute_position_margins(
     start_of_done: dict, positions: dict, seq: list, comp_by_name: dict,
-    prefix: list | None = None,
+    prefix: list | None = None, min_pos: int = 0,
 ) -> dict:
-    """For every schedule position, the minimum slack (current overlap
-    minus latency) among all collectives whose [start_pos+1, done_pos)
-    window covers it right now -- i.e. how much cost could be pulled out of
-    that position without dropping ANY covering collective's overlap below
-    its own latency. A position covered by no collective simply has no
-    entry (callers treat that as infinite margin via .get(i, inf)).
+    """For every schedule position >= min_pos, the minimum slack (current
+    overlap minus latency) among all collectives whose [start_pos+1,
+    done_pos) window covers it right now -- i.e. how much cost could be
+    pulled out of that position without dropping ANY covering collective's
+    overlap below its own latency. A position covered by no collective
+    simply has no entry (callers treat that as infinite margin via
+    .get(i, inf)).
+
+    min_pos lets a caller that only ever queries positions >= some bound
+    (e.g. a candidate scan starting at done_pos+1) skip both collectives
+    whose window ends before that bound entirely and the portion of a
+    straddling window's range below it -- this is the module-wide,
+    O(sum of all window widths) part of the fill loop's per-iteration cost,
+    called fresh on every single candidate placement, so trimming it to
+    only the range that will actually be queried matters a lot. Safe only
+    when the caller's own query range is itself bounded below by min_pos;
+    a caller that queries arbitrary earlier positions (e.g. TRC's
+    margin-safe fallback, which checks a blocker's *current*, possibly far
+    earlier, position) must keep the default min_pos=0.
 
     Generalizes what used to be a binary covered/not-covered distinction
     (a position was either fully off-limits or fully free): a position
@@ -1761,11 +2082,11 @@ def _compute_position_margins(
         if latency is None or latency <= 0:
             continue
         s, d = positions[ag_start], positions[ag_done]
-        if d <= s + 1:
+        if d <= s + 1 or d <= min_pos:
             continue
         overlap = prefix[d] - prefix[s + 1]
         slack = overlap - latency
-        for p in range(s + 1, d):
+        for p in range(max(s + 1, min_pos), d):
             if p not in margins or slack < margins[p]:
                 margins[p] = slack
     return margins
@@ -1837,6 +2158,7 @@ def _fill_exposed_collectives_with_heavy_compute(
     comp_by_name: dict,
     module_name: str,
     give_up_mode: str = "streak",
+    is_while_body: bool = False,
 ) -> tuple[bool, list, dict, dict]:
     """Pull heavy compute instructions backward into earlier collectives'
     still-exposed [start, done) windows, to help hide their latency.
@@ -2014,9 +2336,29 @@ def _fill_exposed_collectives_with_heavy_compute(
                 # Recomputed fresh every iteration -- a prior move in this same
                 # while-loop shifts positions and can change which stretches of
                 # the schedule are covered and by how much slack.
+                # Restricted to the scan range this iteration actually
+                # queries (done_pos+1..len(seq)) -- the direct-placement
+                # gating checks below (`cost > position_margins.get(i, ...)`)
+                # never look outside it. A chase, if one gets triggered
+                # below, needs the *unrestricted* margins instead (a
+                # blocker's own current position can be anywhere, including
+                # well before done_pos+1) -- see the two chase call sites,
+                # which recompute a full-range copy just before calling.
                 position_margins = _compute_position_margins(
                     start_of_done, positions, seq, comp_by_name, prefix=iter_prefix,
+                    min_pos=done_pos + 1,
                 )
+                # Full-range margins for any chase triggered below, computed
+                # lazily (only if a chase actually fires this iteration) and
+                # cached for the rest of this same while-iteration -- a
+                # single scan can refuse-and-retry several blocked
+                # candidates before one either succeeds or the whole
+                # iteration gives up, and each attempt needs the same
+                # full-range snapshot (see the two chase call sites below),
+                # not a fresh O(window-overlap) recompute per attempt.
+                # Discarded (None again) next while-iteration since a
+                # successful chase mutates positions, making it stale.
+                chase_margins = None
                 candidate = None
                 cand_floor = None
                 cand_chain: list = []
@@ -2111,13 +2453,25 @@ def _fill_exposed_collectives_with_heavy_compute(
                                 and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
                                 and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
                             ):
+                                # Full-range margins (lazy per-iteration
+                                # cache set up above), not the
+                                # done_pos+1-restricted `position_margins`
+                                # above -- the chase's margin-safe fallback
+                                # (_try_relocate_blocker_earlier path 2)
+                                # queries at the blocker's *current*
+                                # position, which can be anywhere, including
+                                # well before done_pos+1.
+                                if chase_margins is None:
+                                    chase_margins = _compute_position_margins(
+                                        start_of_done, positions, seq, comp_by_name,
+                                    )
                                 heavy_chased, seq, positions, name_to_pos, _, _, _ = (
                                     _chase_heavy_compute_blocker_chain(
                                         inst, comp, schedule, seq, positions, name_to_pos,
                                         comp_by_name, window["start"], done_pos,
                                         window["latency"], start_of_done,
                                         _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
-                                        position_margins,
+                                        chase_margins, is_while_body=is_while_body,
                                     )
                                 )
                                 if heavy_chased:
@@ -2234,13 +2588,20 @@ def _fill_exposed_collectives_with_heavy_compute(
                                 and _MAX_HEAVY_COMPUTE_CHASE_HOPS > 0
                                 and chase_hops < _MAX_PRODUCER_RELOCATE_HOPS
                             ):
+                                # Full-range margins (lazy per-iteration
+                                # cache) -- see the comment at the FSDP
+                                # scan's equivalent chase call above.
+                                if chase_margins is None:
+                                    chase_margins = _compute_position_margins(
+                                        start_of_done, positions, seq, comp_by_name,
+                                    )
                                 unrestricted_chased, seq, positions, name_to_pos, _, _, _ = (
                                     _chase_heavy_compute_blocker_chain(
                                         inst, comp, schedule, seq, positions, name_to_pos,
                                         comp_by_name, window["start"], done_pos,
                                         window["latency"], start_of_done,
                                         _MAX_HEAVY_COMPUTE_CHASE_HOPS, module_name,
-                                        position_margins,
+                                        chase_margins, is_while_body=is_while_body,
                                     )
                                 )
                                 if unrestricted_chased:
@@ -2331,13 +2692,20 @@ def _fill_exposed_collectives_with_heavy_compute(
 _WHILE_CALLS_RE = re.compile(r"(?:condition|body)=%([A-Za-z0-9_.]+)")
 
 
-def _innermost_first_computations(module, schedule) -> list:
-    """Return non-fusion scheduled computations in innermost-first DFS order.
+def _innermost_first_computations(module, schedule) -> tuple[list, set]:
+    """Return (computations, while_body_comps).
 
-    While-body computations are visited before the computation that contains
-    their while instruction, so that inner schedule changes are committed
-    before outer schedules are processed.  Nested while loops are handled
-    by recursing depth-first.  The entry computation is always last.
+    computations are non-fusion scheduled computations in innermost-first
+    DFS order: while-body computations are visited before the computation
+    that contains their while instruction, so that inner schedule changes
+    are committed before outer schedules are processed.  Nested while loops
+    are handled by recursing depth-first.  The entry computation is always
+    last.
+
+    while_body_comps is the set of computations called as a while body
+    (i.e. every scheduled computation except the true module entry) --
+    exposed so callers can tell "am I working on the entry computation or
+    a while loop" without recomputing the same while-call scan themselves.
     """
     all_comps = [
         c for c in module.make_nonfusion_computations()
@@ -2374,7 +2742,7 @@ def _innermost_first_computations(module, schedule) -> list:
     roots = [c for c in all_comps if c not in all_callees]
     if not roots:
         # Fallback: return in original order (no while loop structure found).
-        return all_comps
+        return all_comps, all_callees
 
     def _collect(comp, visited: set, result: list) -> None:
         if comp in visited:
@@ -2392,7 +2760,7 @@ def _innermost_first_computations(module, schedule) -> list:
     for comp in all_comps:
         if comp not in visited:
             result.append(comp)
-    return result
+    return result, all_callees
 
 
 _WHILE_BODY_RE = re.compile(r"\bbody=%([A-Za-z0-9_.]+)")
@@ -2468,6 +2836,7 @@ def _fill_exposed_collectives_best_of(
     name_to_pos: dict,
     comp_by_name: dict,
     module_name: str,
+    is_while_body: bool = False,
 ) -> tuple[bool, list, dict, dict]:
     """Try every _GIVE_UP_MODES strategy for
     _fill_exposed_collectives_with_heavy_compute against this computation,
@@ -2512,7 +2881,7 @@ def _fill_exposed_collectives_best_of(
         pre_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
         changed, seq, positions, name_to_pos = _fill_exposed_collectives_with_heavy_compute(
             list(seq), schedule, comp, start_of_done, dict(positions), dict(name_to_pos),
-            comp_by_name, module_name, give_up_mode=cached_mode,
+            comp_by_name, module_name, give_up_mode=cached_mode, is_while_body=is_while_body,
         )
         post_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
         _logger.info(
@@ -2534,7 +2903,7 @@ def _fill_exposed_collectives_best_of(
             _fill_exposed_collectives_with_heavy_compute(
                 list(baseline_seq), schedule, comp, start_of_done,
                 dict(baseline_positions), dict(baseline_name_to_pos),
-                comp_by_name, module_name, give_up_mode=mode,
+                comp_by_name, module_name, give_up_mode=mode, is_while_body=is_while_body,
             )
         )
         total = _total_exposed_us(start_of_done, trial_positions, trial_seq, comp_by_name)
@@ -2582,6 +2951,418 @@ _diag_hidden_windows: list[dict] = []
 _fill_strategy_cache: dict[str, str] = {}
 
 
+def _may_hoist_control_pred(pred, new_pos, seq, positions, comp_by_name) -> bool:
+    """Whether control-predecessor `pred` may move earlier to new_pos.
+
+    No cost or opcode criterion: an FSDP start's control-predecessors are
+    hoisted to their own earliest legal position whatever they are. The one
+    guard is for an async-done, since moving it earlier shrinks its own
+    start's window: refused if that start has a profiled latency the shrunken
+    window no longer covers.
+    """
+    opc = _opcode_str(pred)
+    if not _HOIST_ASYNC_DONE_GUARD or not (opc == "async-done" or opc.endswith("-done")):
+        return True
+    ops = list(pred.operands())
+    start = ops[0] if ops else None
+    if start is None or start not in positions:
+        return False
+    try:
+        latency = _profile_costs.get(_resolve_profile_key(start, comp_by_name), 0.0)
+    except Exception:
+        latency = 0.0
+    if not latency or latency <= 0:
+        return True
+    remaining = sum(
+        _resolve_inst_cost(seq[i], comp_by_name)
+        for i in range(positions[start] + 1, new_pos)
+    )
+    return remaining >= latency
+
+
+def _is_te_ep_call(inst, comp_by_name: dict) -> bool:
+    """True if inst is any te_ep async call-start (prepare, dispatch or combine)."""
+    if not _is_async_start(inst):
+        return False
+    return _resolve_profile_key(inst, comp_by_name).startswith(_TE_EP_PREFIX)
+
+
+def _fsdp_te_ep_defer_target(
+    ag_start, ag_done, floor, seq, positions, comp_by_name, latency, committed,
+):
+    """Index in seq to place an FSDP start before, or None for "earliest legal position".
+
+    All NCCL work (FSDP collectives and te_ep calls) shares one stream, so an
+    FSDP start launched ahead of a te_ep call delays that call, and compute that
+    needs its result sits idle (job 3212382: all-gather.142 and
+    reduce-scatter.50/.51 ran back to back ahead of te_ep_prepare_ffi.12, leaving
+    the compute stream idle ~3.5 ms). So:
+      1. If the heavy compute between the floor and the first te_ep call can still
+         cover this collective (after the latency of FSDP collectives already
+         placed there), start it at the floor.
+      2. Otherwise start it right before the first heavy compute after that te_ep
+         call that depends on a te_ep call-done and is followed by enough heavy
+         compute to cover its latency.
+      3. Otherwise None.
+    """
+    if not latency or latency <= 0:
+        return None
+    done_pos = positions[ag_done]
+    first_te = next(
+        (i for i in range(floor, done_pos) if _is_te_ep_call(seq[i], comp_by_name)), None,
+    )
+    if first_te is None:
+        return None
+
+    def heavy(i) -> float:
+        inst = seq[i]
+        if _is_async_start(inst) or _opcode_str(inst).endswith("-done"):
+            return 0.0
+        cost = _resolve_inst_cost(inst, comp_by_name)
+        return cost if cost >= _HEAVY_COMPUTE_MIN_US else 0.0
+
+    key = seq[first_te].name
+    available = sum(heavy(i) for i in range(floor, first_te)) - committed.get(key, 0.0)
+    if available >= latency:
+        committed[key] = committed.get(key, 0.0) + latency
+        return None
+
+    te_done = set()
+    for inst in seq:
+        if _is_te_ep_call(inst, comp_by_name):
+            te_done.update(inst.users())
+    depends: dict = {}
+    for inst in seq:
+        depends[inst] = inst in te_done or any(depends.get(op, False) for op in inst.operands())
+    suffix = [0.0] * (done_pos + 1)
+    for i in range(done_pos - 1, first_te, -1):
+        suffix[i] = suffix[i + 1] + heavy(i)
+    for i in range(first_te + 1, done_pos):
+        if heavy(i) > 0 and depends[seq[i]] and suffix[i] >= latency:
+            return i
+    return None
+
+
+def _simulate_comm_stream(order, cost: dict, lat: dict, done_start: dict):
+    """Simulate compute (in `order`) against one FIFO communication stream.
+
+    Compute ops run back to back at their profiled cost. Every async start is
+    queued on the comm stream and begins at the later of its issue time and the
+    end of the previous queued op; an async done stalls compute until its start
+    has finished. Returns (total stall us, {done: stall us}).
+
+    NCCL collectives and te_ep calls share one stream, so a collective issued
+    behind a te_ep call can't start until that call's kernels finish, and a
+    te_ep call issued behind a collective waits for it (job 3212637). The
+    static window cost used elsewhere doesn't see either effect.
+    """
+    t = 0.0
+    comm = 0.0
+    end: dict = {}
+    total = 0.0
+    stalls: dict = {}
+    for inst in order:
+        start = done_start.get(inst)
+        if start is not None:
+            e = end.get(start)
+            if e is not None and e > t:
+                stalls[inst] = e - t
+                total += e - t
+                t = e
+        elif inst in lat:
+            begin = t if t > comm else comm
+            comm = begin + lat[inst]
+            end[inst] = comm
+        else:
+            t += cost.get(inst, 0.0)
+    return total, stalls
+
+
+def _best_fsdp_placement(
+    ag_start, ag_done, floor, to_move, seq, positions, cost, lat, done_start, ctrl_succs,
+):
+    """Choose where to put an FSDP start (and its done) to minimize simulated stalls.
+
+    Candidates are insertion points for the start between its earliest legal
+    position and the first consumer of its done. The done may stay put or move
+    to just before its first consumer, so a start placed after its current
+    done shifts the done along with it. Both stay within topological order:
+    the start after its operands and control-predecessors, the done after the
+    start and before its consumers and control-successors. A start moving
+    earlier brings its trivial operand chain (`to_move`); one moving later
+    leaves the chain where it is.
+
+    Ties prefer leaving the done alone, then the earliest start. Returns
+    (key, early, start_idx, done_idx, base) or None, where indices are into
+    `base` (seq without the moved instructions) and key[0] is the simulated
+    total stall.
+    """
+    start_pos = positions[ag_start]
+    done_pos = positions[ag_done]
+    consumers = [positions[u] for u in ag_done.users() if u in positions]
+    consumers += [positions[x] for x in ctrl_succs.get(ag_done.name, []) if x in positions]
+    if not consumers:
+        return None
+    user_pos = min(consumers)
+    p_max = min(
+        [user_pos]
+        + [positions[x] for x in ctrl_succs.get(ag_start.name, []) if x in positions and x is not ag_done]
+    )
+    best = None
+    for early in (True, False):
+        rem = {ag_start, ag_done} | (set(to_move) if early else set())
+        removed_before = [0] * (len(seq) + 1)
+        count = 0
+        for i, inst in enumerate(seq):
+            removed_before[i] = count
+            if inst in rem:
+                count += 1
+        removed_before[len(seq)] = count
+        base = [inst for inst in seq if inst not in rem]
+        lo, hi = (floor, start_pos) if early else (start_pos + 1, p_max)
+        hi = min(hi, p_max)
+        q_latest = user_pos - removed_before[user_pos]
+        q_cur = done_pos - removed_before[done_pos]
+        for i in range(lo, hi + 1):
+            if i < len(seq) and i not in (lo, hi, start_pos):
+                inst = seq[i]
+                if not (
+                    cost.get(inst, 0.0) >= _HEAVY_COMPUTE_MIN_US
+                    or inst in lat
+                    or inst in done_start
+                ):
+                    continue
+            pb = i - removed_before[i] if i < len(seq) else len(base)
+            for q in {q_latest, q_cur}:
+                if q < pb:
+                    continue
+                order = base[:pb] + [ag_start] + base[pb:q] + [ag_done] + base[q:]
+                total, _ = _simulate_comm_stream(order, cost, lat, done_start)
+                key = (round(total, 1), q != q_cur, pb)
+                if best is None or key < best[0]:
+                    best = (key, early, pb, q, base)
+    return best
+
+
+# Recursion bound when hoisting a control-predecessor whose own latest operand
+# must move first.
+_MAX_PRED_HOIST_DEPTH = 8
+
+
+def _hoist_fsdp_starts_to_floor(
+    seq, schedule, comp, start_of_done, positions, name_to_pos, comp_by_name, module_name,
+):
+    """Move each FSDP start in a while body to its earliest legal position.
+
+    Runs after the fill step. The per-collective loop in _phase1_reorder skips
+    a collective once its static window looks hidden, and later fill/chase
+    moves can then land compute ahead of it that it has no dependency on
+    (job 3204509's all-gather-start.9 sat after te_grouped_quantize_ffi.177.
+    double_buffer_clone and the dynamic_slice_fusion.25 GEMM). Its operand
+    slices carry control-predecessors (loop_add_fusion.9/10, bitcasts of
+    earlier all-gather-dones, DUS/async-done fusions) whose current positions
+    set the floor even though they could themselves sit much earlier. So while
+    a control-predecessor pins the floor, move that predecessor to its
+    own earliest legal position (after its operands and control-predecessors),
+    then move the start and its trivial operand chain. The done stays put, so
+    the window only grows.
+    """
+    changed = False
+
+    def _move_earlier(inst, depth) -> bool:
+        """Move inst to just after its latest operand/control-predecessor.
+
+        If it has no room because that latest one sits right before it (e.g.
+        a bitcast chain), hoist that one first, recursively up to `depth`.
+        """
+        nonlocal seq, positions, name_to_pos, changed
+        pos = positions[inst]
+        floor, binder = 0, None
+        for op in inst.operands():
+            p = positions.get(op)
+            if p is not None and p + 1 > floor:
+                floor, binder = p + 1, op
+        for name in _control_predecessor_names(inst):
+            p = name_to_pos.get(name)
+            if p is not None and p + 1 > floor:
+                floor, binder = p + 1, seq[p]
+        if floor < pos:
+            if not _may_hoist_control_pred(inst, floor, seq, positions, comp_by_name):
+                _logger.debug(
+                    "collective_overlap_pass [%s]: HOISTDIAG %s (pos %d, floor %d): refused by async-done guard.",
+                    module_name, inst.name, pos, floor,
+                )
+                return False
+            moving = {inst}
+            new_seq = [i for i in seq if i not in moving]
+            if len(new_seq) != len(seq) - 1:
+                _logger.warning(
+                    "collective_overlap_pass [%s]: HOISTDIAG %s not found exactly once in sequence; skipping move.",
+                    module_name, inst.name,
+                )
+                return False
+            new_seq.insert(floor, inst)
+            schedule.set_sequence(comp, new_seq)
+            seq = new_seq
+            positions = {i: k for k, i in enumerate(seq)}
+            name_to_pos = {i.name: k for i, k in positions.items()}
+            changed = True
+            return True
+        if binder is None or depth <= 0:
+            _logger.debug(
+                "collective_overlap_pass [%s]: HOISTDIAG %s (pos %d, floor %d): %s.",
+                module_name, inst.name, pos, floor,
+                "no operand/control-predecessor to hoist" if binder is None else "depth limit reached",
+            )
+            return False
+        _logger.debug(
+            "collective_overlap_pass [%s]: HOISTDIAG %s (pos %d): no room, latest dependency is %s (pos %d, %s); hoisting it first.",
+            module_name, inst.name, pos, binder.name, positions[binder], _opcode_str(binder),
+        )
+        if not _move_earlier(binder, depth - 1):
+            return False
+        return _move_earlier(inst, depth - 1)
+
+    te_ep_committed: dict = {}
+    sim_cost: dict = {}
+    sim_lat: dict = {}
+    ctrl_succs: dict = {}
+    if _FSDP_STREAM_MODEL:
+        for inst in seq:
+            if _is_async_start(inst) or _opcode_str(inst).endswith("-done"):
+                sim_cost[inst] = 0.0
+            else:
+                sim_cost[inst] = _resolve_inst_cost(inst, comp_by_name)
+            for name in _control_predecessor_names(inst):
+                ctrl_succs.setdefault(name, []).append(inst)
+        for d_inst, s_inst in start_of_done.items():
+            try:
+                sim_lat[s_inst] = _profile_costs.get(_resolve_profile_key(s_inst, comp_by_name), 0.0) or 0.0
+            except Exception:
+                sim_lat[s_inst] = 0.0
+        _logger.info(
+            "collective_overlap_pass [%s]: stream model: %s simulated total exposed %.1f us before FSDP placement.",
+            module_name, comp.name, _simulate_comm_stream(seq, sim_cost, sim_lat, start_of_done)[0],
+        )
+    for ag_done, ag_start in sorted(start_of_done.items(), key=lambda kv: positions[kv[1]]):
+        profile_key = _resolve_profile_key(ag_start, comp_by_name)
+        if not profile_key.startswith(_FSDP_COLLECTIVE_PREFIXES):
+            continue
+        orig_pos = positions[ag_start]
+        for _ in range(_MAX_PRODUCER_RELOCATE_HOPS):
+            cp_pins: list = []
+            floor, to_move, _blk = _earliest_legal_pos(
+                ag_start, positions, name_to_pos, comp_by_name, cp_pins,
+            )
+            if not cp_pins:
+                break
+            pin_pos, pin_name = max(cp_pins)
+            if pin_pos + 1 < floor or pin_pos + 1 < 1:
+                break  # data dependency pins the floor, not a control-predecessor
+            pred = seq[pin_pos]
+            if not _move_earlier(pred, _MAX_PRED_HOIST_DEPTH):
+                _logger.debug(
+                    "collective_overlap_pass [%s]: %s floor %d pinned by control-predecessor %s "
+                    "(pos %d) which could not be hoisted.",
+                    module_name, ag_start.name, floor, pin_name, pin_pos,
+                )
+                break
+            _logger.debug(
+                "collective_overlap_pass [%s]: hoisted control-predecessor %s of %s from pos %d.",
+                module_name, pin_name, ag_start.name, pin_pos,
+            )
+        floor, to_move, _blk = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
+        start_pos = positions[ag_start]
+        if _FSDP_STREAM_MODEL and sim_lat.get(ag_start, 0.0) > 0:
+            before = _simulate_comm_stream(seq, sim_cost, sim_lat, start_of_done)[0]
+            best = _best_fsdp_placement(
+                ag_start, ag_done, floor, to_move, seq, positions, sim_cost, sim_lat,
+                start_of_done, ctrl_succs,
+            )
+            _logger.debug(
+                "collective_overlap_pass [%s]: STREAMDIAG %s: start pos %d, done pos %d, floor %d, to_move %d, "
+                "latency %.1f us, simulated total %.1f us; best %s.",
+                module_name, ag_start.name, start_pos, positions[ag_done], floor, len(to_move),
+                sim_lat.get(ag_start, 0.0), before,
+                "none" if best is None else "total %.1f us at base idx %d, done idx %d, %s" % (
+                    best[0][0], best[2], best[3], "chain moved" if best[1] else "chain stays"),
+            )
+            if best is not None:
+                key, early, pb, q, base = best
+                if key[0] <= before + 0.05:
+                    done_pos_old = positions[ag_done]
+                    new_seq = (
+                        base[:pb] + (list(to_move) if early else []) + [ag_start]
+                        + base[pb:q] + [ag_done] + base[q:]
+                    )
+                    if len(new_seq) == len(seq) and set(new_seq) == set(seq) and new_seq != seq:
+                        schedule.set_sequence(comp, new_seq)
+                        seq = new_seq
+                        positions = {inst: i for i, inst in enumerate(seq)}
+                        name_to_pos = {inst.name: i for inst, i in positions.items()}
+                        changed = True
+                        _logger.info(
+                            "collective_overlap_pass [%s]: stream model placed %s: start pos %d -> %d, done pos %d -> %d "
+                            "(simulated total exposed %.1f -> %.1f us).",
+                            module_name, ag_start.name, orig_pos, positions[ag_start],
+                            done_pos_old, positions[ag_done], before, key[0],
+                        )
+                    continue
+        target = None
+        if _FSDP_TE_EP_AWARE:
+            target = _fsdp_te_ep_defer_target(
+                ag_start, ag_done, floor, seq, positions, comp_by_name,
+                _profile_costs.get(profile_key), te_ep_committed,
+            )
+        if target is not None:
+            if target > start_pos:
+                # Moving later: stop before any instruction that is control-ordered after the start.
+                for k in range(start_pos + 1, target):
+                    if ag_start.name in _control_predecessor_names(seq[k]):
+                        target = k
+                        break
+                to_move = []
+            if target == start_pos or target == start_pos + 1:
+                continue
+            to_move_set = set(to_move) | {ag_start}
+            new_seq = [inst for inst in seq if inst not in to_move_set]
+            ins_pos = sum(1 for inst in seq[:target] if inst not in to_move_set)
+            for inst in to_move:
+                new_seq.insert(ins_pos, inst)
+                ins_pos += 1
+            new_seq.insert(ins_pos, ag_start)
+            schedule.set_sequence(comp, new_seq)
+            seq = new_seq
+            positions = {inst: i for i, inst in enumerate(seq)}
+            name_to_pos = {inst.name: i for inst, i in positions.items()}
+            changed = True
+            _logger.info(
+                "collective_overlap_pass [%s]: placed %s at pos %d (was %d) before te_ep-dependent heavy compute (te_ep-aware).",
+                module_name, ag_start.name, positions[ag_start], orig_pos,
+            )
+            continue
+        if floor + len(to_move) >= start_pos:
+            continue
+        to_move_set = set(to_move) | {ag_start}
+        new_seq = [inst for inst in seq if inst not in to_move_set]
+        ins_pos = floor
+        for inst in to_move:
+            new_seq.insert(ins_pos, inst)
+            ins_pos += 1
+        new_seq.insert(ins_pos, ag_start)
+        schedule.set_sequence(comp, new_seq)
+        seq = new_seq
+        positions = {inst: i for i, inst in enumerate(seq)}
+        name_to_pos = {inst.name: i for inst, i in positions.items()}
+        changed = True
+        _logger.info(
+            "collective_overlap_pass [%s]: hoisted %s from pos %d to %d with %d "
+            "relocated operand(s) (final floor pass).",
+            module_name, ag_start.name, orig_pos, positions[ag_start], len(to_move),
+        )
+    return changed, seq, positions, name_to_pos
+
+
 def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
     """Move async collective starts earlier where latency is under-hidden.
 
@@ -2597,7 +3378,16 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
     # for triviality — see _is_trivial_fusion_body.
     comp_by_name = {c.name: c for c in module.computations()}
 
-    for comp in _innermost_first_computations(module, schedule):
+    ordered_comps, while_body_comps = _innermost_first_computations(module, schedule)
+    for comp in ordered_comps:
+        is_while_body = comp in while_body_comps
+        if _WHILE_BODY_ONLY and not is_while_body:
+            _logger.debug(
+                "collective_overlap_pass [%s]: COLLECTIVE_OVERLAP_WHILE_BODY_ONLY=1 "
+                "-- skipping entry computation %s entirely.",
+                module_name, comp.name,
+            )
+            continue
         seq = list(schedule.sequence(comp))
 
         start_of_done: dict = {}
@@ -2667,6 +3457,15 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                     "(overlap=%.1f us >= latency=%.1f us).",
                     module_name, ag_start.name, current_overlap, collective_latency,
                 )
+                if profile_key.startswith(_FSDP_COLLECTIVE_PREFIXES):
+                    done_moved, seq, positions, name_to_pos = _relocate_fsdp_done_before_te_ep(
+                        ag_start, ag_done, comp, schedule, seq, positions, name_to_pos,
+                        comp_by_name, collective_latency, module_name,
+                    )
+                    if done_moved:
+                        changed = True
+                        ag_start_pos = positions[ag_start]
+                        ag_done_pos = positions[ag_done]
                 _hidden_entry = {
                     "comp": comp,
                     "ag_start": ag_start,
@@ -2697,6 +3496,29 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
             # that isn't an actual data/control dependency of its own.
             floor, to_move, blocker = _earliest_legal_pos(ag_start, positions, name_to_pos, comp_by_name)
             orig_ag_start_pos = ag_start_pos  # for the "moved from X to Y" log below
+
+            # For FSDP collectives (all-gather/reduce-scatter), the above
+            # floor only ever walks ag_start's own *trivial* operand chain
+            # -- it stops cold at the first non-trivial (real) producer,
+            # never asking whether that producer itself has room to move.
+            # If an unrelated, genuinely heavy instruction (a GEMM) with no
+            # data dependency on ag_start at all sits even further back,
+            # structurally reachable, ag_start still reports "cannot move"
+            # because nothing ever tried relocating its own blocker out of
+            # the way first. See _chase_ag_start_blocker_toward_heavy_compute's
+            # docstring for the concrete case (job 3204236) that motivated
+            # this.
+            if profile_key.startswith(_FSDP_COLLECTIVE_PREFIXES):
+                (
+                    chased_blocker, seq, positions, name_to_pos, floor, to_move, blocker,
+                ) = _chase_ag_start_blocker_toward_heavy_compute(
+                    ag_start, comp, schedule, seq, positions, name_to_pos, comp_by_name,
+                    _MAX_PRODUCER_RELOCATE_HOPS, module_name,
+                )
+                if chased_blocker:
+                    changed = True
+                    ag_start_pos = positions[ag_start]
+                    ag_done_pos = positions[ag_done]
 
             # ag_start's own trivial chain lands immediately before it, so
             # its actual post-move position is floor + len(to_move), not
@@ -2772,9 +3594,17 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                         effective_producer_pos=eff_positions,
                         total_latency_us=collective_latency,
                     ))
+            elif profile_key.startswith(_FSDP_COLLECTIVE_PREFIXES):
+                done_moved, seq, positions, name_to_pos = _relocate_fsdp_done_before_te_ep(
+                    ag_start, ag_done, comp, schedule, seq, positions, name_to_pos,
+                    comp_by_name, collective_latency, module_name,
+                )
+                if done_moved:
+                    changed = True
 
         heavy_changed, seq, positions, name_to_pos = _fill_exposed_collectives_best_of(
             seq, schedule, comp, start_of_done, positions, name_to_pos, comp_by_name, module_name,
+            is_while_body=is_while_body,
         )
         if heavy_changed:
             changed = True
@@ -2802,6 +3632,14 @@ def _phase1_reorder(module, schedule, module_name: str) -> tuple[bool, list[_Spl
                     cand.deficit_us = remaining
                     still_needed.append(cand)
             split_candidates = still_needed
+
+        if is_while_body and _HOIST_FSDP_STARTS:
+            hoist_changed, seq, positions, name_to_pos = _hoist_fsdp_starts_to_floor(
+                seq, schedule, comp, start_of_done, positions, name_to_pos,
+                comp_by_name, module_name,
+            )
+            if hoist_changed:
+                changed = True
 
         # DIAGNOSTIC (temporary): re-check every "already hidden" verdict
         # from this comp against the final seq/positions, since neither the
@@ -3447,20 +4285,45 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
     if not any_split:
         return None
 
-    # XLA's CreateFromProto processes computations in proto order and builds the
-    # computation_map incrementally.  Callee computations must appear BEFORE their
-    # callers.  The module entry computation must be last since it calls everything
-    # else (including new async sub-computations added by phase 2).
-    _module_entry_id = module_entry_comp.id
-    _reordered = [c for c in proto.computations if c.id != _module_entry_id]
-    _entry_protos = [c for c in proto.computations if c.id == _module_entry_id]
-    _reordered.extend(_entry_protos)
+    # XLA's CreateFromProto processes computations in proto order and builds
+    # the computation_map incrementally -- every callee must appear before
+    # its caller. A "module entry must be last" special case is NOT enough:
+    # entry_comp (the split target for this invocation, see _target_comp_for
+    # above) can itself be a while-body computation rather than the true
+    # module entry, and it gains new callees too (the newly created async
+    # sub-computations) -- but as a pre-existing non-entry computation it
+    # would otherwise keep its original, earlier position, landing before
+    # its own new callees, which are simply appended at the end. Confirmed
+    # failing in practice (job 3203819): "all-gather-start.6.g0 instruction
+    # references invalid computation id(s)" (RET_CHECK at
+    # hlo_instruction.cc:391) from exactly this case. Full topological sort
+    # by actual call graph (post-order DFS, callees appended before their
+    # caller) handles both the true-entry and while-body-target cases
+    # uniformly.
+    _id_to_proto_comp = {c.id: c for c in proto.computations}
+    _visited: set[int] = set()
+    _topo_ordered: list = []
+
+    def _visit_comp(_cid: int) -> None:
+        if _cid in _visited:
+            return
+        _visited.add(_cid)
+        _c = _id_to_proto_comp.get(_cid)
+        if _c is None:
+            return
+        for _inst in _c.instructions:
+            for _callee_id in _inst.called_computation_ids:
+                _visit_comp(_callee_id)
+        _topo_ordered.append(_c)
+
+    for _c in proto.computations:
+        _visit_comp(_c.id)
     del proto.computations[:]
-    for _c in _reordered:
+    for _c in _topo_ordered:
         proto.computations.add().CopyFrom(_c)
     sys.stderr.write(
-        f"[split_core] reordered computations: {len(_reordered)} total, "
-        f"module entry last (id={_module_entry_id})\n"
+        f"[split_core] topologically reordered computations: "
+        f"{len(_topo_ordered)} total\n"
     )
 
     return proto.SerializeToString()
