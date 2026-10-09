@@ -419,6 +419,80 @@ def _opcode_str(inst) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "-", inst.opcode.name[1:]).lower()
 
 
+# Host-offload copies: XLA lowers a remat offload to a pair of async DMAs,
+# D2H as an async dynamic-update-slice into a host-memory-space buffer (S(5)) in
+# the forward pass and H2D as an async dynamic-slice out of that buffer in the
+# backward pass. They are copies, not collectives, yet PGLE profiles them under
+# a start->done span (job 3275396: ~31-34 ms for a ~100 MB copy), which would
+# otherwise show up as the largest "exposed collective", count as 33 ms of
+# compute hiding any window it sits in, and tempt the fill/chase logic into
+# moving it. Both directions are excluded from every collective computation and
+# instead hoisted to their earliest legal start
+# (_hoist_host_offload_copy_starts) so the DMA gets the longest window.
+_HOST_MEMORY_SPACE_TAG = ":S(5)"
+_HOIST_HOST_OFFLOAD_COPIES = os.environ.get("COLLECTIVE_OVERLAP_HOIST_OFFLOAD_COPIES", "1") != "0"
+# Names (instruction names are unique per module) of host-offload copy starts
+# and their dones in the module being processed; see _register_host_offload_copies.
+_host_offload_copy_names: set[str] = set()
+
+
+# Unlike _CALLS_RE, allows hyphens: the wrapped computations are named
+# e.g. wrapped_dynamic-update-slice_computation.
+_HOST_COPY_CALLS_RE = re.compile(r"calls=%([\w.\-]+)")
+
+
+def _host_offload_copy_kind(inst, comp_by_name: dict) -> Optional[str]:
+    """"d2h" for an async dynamic-update-slice writing a host-memory-space
+    buffer, "h2d" for an async dynamic-slice reading one, else None.
+
+    The scheduled module prints these as "fusion-start" with
+    calls=%wrapped_dynamic-(update-)slice_computation, so follow the start's
+    calls= to the computation whose root is the DUS/DS (a few hops, in case
+    of nested wrappers). Parsed from text: async_wrapped_root() is not reliable
+    for these.
+    """
+    if _opcode_str(inst) != "async-start":
+        return None
+    try:
+        text = inst.to_string()
+    except Exception:
+        return None
+    if _HOST_MEMORY_SPACE_TAG not in text:
+        return None
+    for _hop in range(4):
+        m = _HOST_COPY_CALLS_RE.search(text)
+        comp = comp_by_name.get(m.group(1)) if m else None
+        root = _computation_root(comp) if comp is not None else None
+        if root is None:
+            return None
+        kind = {"dynamic-update-slice": "d2h", "dynamic-slice": "h2d"}.get(_opcode_str(root))
+        if kind is not None:
+            return kind
+        try:
+            text = root.to_string()
+        except Exception:
+            return None
+    return None
+
+
+def _register_host_offload_copies(module) -> None:
+    """Rebuild _host_offload_copy_names (starts and their dones) from `module`."""
+    names: set[str] = set()
+    comp_by_name = {c.name: c for c in module.computations()}
+    for comp in module.make_nonfusion_computations():
+        for inst in comp.instructions():
+            if _host_offload_copy_kind(inst, comp_by_name) is not None:
+                names.add(inst.name)
+                names.update(user.name for user in inst.users())
+    _host_offload_copy_names.clear()
+    _host_offload_copy_names.update(names)
+    if names:
+        _logger.info(
+            "collective_overlap_pass [%s]: registered %d host-offload copy instruction(s) (starts and dones): %s",
+            module.name, len(names), ", ".join(sorted(names)),
+        )
+
+
 def _is_async_start(inst: object) -> bool:
     """True if `inst` is the Start half of an async collective.
 
@@ -426,14 +500,18 @@ def _is_async_start(inst: object) -> bool:
     collectives (all-gather/reduce-scatter/all-reduce), te_ep call-starts and
     trivial passthrough wrappers alike, and there is no cheap reliable way to
     tell them apart by opcode/attributes. A trivial wrapper never shows a
-    deficit worth acting on.
+    deficit worth acting on. Host-offload copies are the exception: they are
+    recognized (see _host_offload_copy_names) and excluded.
     """
+    if inst.name in _host_offload_copy_names:
+        return False
     opcode = _opcode_str(inst)
     return opcode in _ASYNC_START_OPCODES or opcode == "async-start"
 
 
 def _module_has_interesting_async_ops(module) -> bool:
     """True if any non-fusion computation has an async-start (cheap early-out)."""
+    _register_host_offload_copies(module)
     for comp in module.make_nonfusion_computations():
         for inst in comp.instructions():
             if _is_async_start(inst):
@@ -728,6 +806,8 @@ def _resolve_inst_cost(inst, comp_by_name: dict) -> float:
     a dynamic-update-slice) has no entry of its own, so sum the entries of
     every instruction in its nested computation.
     """
+    if inst.name in _host_offload_copy_names:
+        return 0.0  # DMA, not SM compute: hides nothing
     direct = _profile_costs.get(inst.name)
     if direct:
         return direct
@@ -3067,6 +3147,60 @@ def _log_final_exposed_summary(module, schedule, module_name: str, label: str) -
     )
 
 
+def _hoist_host_offload_copy_starts(module, schedule, module_name: str) -> bool:
+    """Move every host-offload copy start to its earliest legal position.
+
+    Runs last, after all other relocation, so nothing leaves a copy later than
+    its data allows. A D2H copy updates its host buffer in place, so a start
+    whose host-buffer operand has other users is left alone (those readers must
+    stay ordered before the in-place write). H2D copies only read it.
+    """
+    if not _HOIST_HOST_OFFLOAD_COPIES or not _host_offload_copy_names:
+        return False
+    comp_by_name = {c.name: c for c in module.computations()}
+    changed = False
+    for comp in module.make_nonfusion_computations():
+        seq = schedule.sequence(comp)
+        if seq is None:
+            continue
+        seq = list(seq)
+        starts = [i for i in seq if i.name in _host_offload_copy_names and _opcode_str(i) == "async-start"]
+        if not starts:
+            continue
+        positions = {inst: i for i, inst in enumerate(seq)}
+        name_to_pos = {inst.name: i for inst, i in positions.items()}
+        for start in starts:
+            operands = list(start.operands())
+            # Only the D2H copy writes its host buffer in place; the H2D slice
+            # just reads it.
+            if (
+                _host_offload_copy_kind(start, comp_by_name) == "d2h"
+                and operands
+                and len(list(operands[0].users())) > 1
+            ):
+                _logger.info(
+                    "collective_overlap_pass [%s]: host-offload copy %s: host buffer %s has other users; not hoisting.",
+                    module_name, start.name, operands[0].name,
+                )
+                continue
+            floor, movable, _ = _earliest_legal_pos(start, positions, name_to_pos, comp_by_name)
+            old_pos = positions[start]
+            if floor >= old_pos:
+                continue
+            new_seq = _reinsert(seq, movable, floor, start)
+            # The start lands after its relocated operand chain, so a "move" can
+            # leave it at the same index; commit only real moves.
+            if new_seq.index(start) >= old_pos:
+                continue
+            seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
+            changed = True
+            _logger.info(
+                "collective_overlap_pass [%s]: hoisted host-offload copy %s in %s from pos %d to %d with %d relocated operand(s).",
+                module_name, start.name, comp.name, old_pos, positions[start], len(movable),
+            )
+    return changed
+
+
 def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool, list[_SplitCandidate]]:
     """Run _phase1_reorder to a fixed point.
 
@@ -3109,6 +3243,11 @@ def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool
             schedule.update()
             schedule.verify()
             module.set_schedule(schedule)
+    if _hoist_host_offload_copy_starts(module, schedule, module_name):
+        changed = True
+        schedule.update()
+        schedule.verify()
+        module.set_schedule(schedule)
     return changed, split_candidates
 
 
@@ -3124,6 +3263,7 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
     if schedule is None:
         return None
 
+    _register_host_offload_copies(module)
     module_name = module.name
 
     _log_profile_coverage_gaps(module, schedule, module_name)
