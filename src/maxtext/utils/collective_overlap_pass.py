@@ -354,16 +354,15 @@ _ASYNC_START_OPCODES = frozenset({
 })
 
 # Minimum deficit (us) for phase-2 splitting. COLLECTIVE_OVERLAP_DISABLE_SPLIT=1
-# disables it; that measured much worse (job 3193360: 149,096 us exposed vs
-# 67,840 us with split; reproduced at full scale, job 3202509).
+# disables it; that measured much worse.
 _SPLIT_DEFICIT_THRESHOLD_US = (
     float("inf") if os.environ.get("COLLECTIVE_OVERLAP_DISABLE_SPLIT") == "1"
     else 500.0
 )
 
 # COLLECTIVE_OVERLAP_WHILE_BODY_ONLY=1 skips the entry computation, which is by
-# far the largest sequence and dominates compile time (deep chase chains, job
-# 3204127's 20-minute timeout). Trades its overlap away for faster compiles.
+# far the largest sequence and dominates compile time.
+# Trades its overlap away for faster compiles.
 _WHILE_BODY_ONLY = os.environ.get("COLLECTIVE_OVERLAP_WHILE_BODY_ONLY") == "1"
 
 # COLLECTIVE_OVERLAP_HOIST_FSDP_STARTS=0 disables the final per-while-body step
@@ -374,18 +373,14 @@ _HOIST_FSDP_STARTS = os.environ.get("COLLECTIVE_OVERLAP_HOIST_FSDP_STARTS", "1")
 # COLLECTIVE_OVERLAP_FSDP_STREAM_MODEL=0 disables the comm-stream model that
 # places FSDP starts/dones in the hoist step (_best_fsdp_placement). While on,
 # it also owns FSDP done placement in while bodies and
-# _relocate_fsdp_done_before_te_ep is skipped there: that step left
-# reduce-scatter.67/.68 with no compute to hide behind (job 3213143, 0% -> 100%
-# exposed, ~198 ms/step).
+# _relocate_fsdp_done_before_te_ep is skipped there.
 _FSDP_STREAM_MODEL = os.environ.get("COLLECTIVE_OVERLAP_FSDP_STREAM_MODEL", "1") != "0"
 # Simulated totals within this many us of the best are treated as equal when
 # placing an FSDP start, so the earliest start (largest window) wins. Without
-# it a ~30 us modeled gain moved reduce-scatter starts next to their dones
-# (job 3213143).
+# it a ~30 us modeled gain moved collective starts next to their dones.
 _FSDP_STREAM_TOL_US = float(os.environ.get("COLLECTIVE_OVERLAP_FSDP_STREAM_TOL_US", "250"))
 # SM gating: a launched heavy GEMM holds the SMs, so a collective kernel can't
-# begin until it ends (job 3215273: simulated start times matched within
-# ~0.1 ms). COLLECTIVE_OVERLAP_SM_GATE=0 disables; GEMMs shorter than
+# begin until it ends. COLLECTIVE_OVERLAP_SM_GATE=0 disables; GEMMs shorter than
 # COLLECTIVE_OVERLAP_SM_GATE_MIN_US are ignored.
 _SM_GATE = os.environ.get("COLLECTIVE_OVERLAP_SM_GATE", "1") != "0"
 _SM_GATE_MIN_US = float(os.environ.get("COLLECTIVE_OVERLAP_SM_GATE_MIN_US", "1000"))
@@ -423,7 +418,7 @@ def _opcode_str(inst) -> str:
 # D2H as an async dynamic-update-slice into a host-memory-space buffer (S(5)) in
 # the forward pass and H2D as an async dynamic-slice out of that buffer in the
 # backward pass. They are copies, not collectives, yet PGLE profiles them under
-# a start->done span (job 3275396: ~31-34 ms for a ~100 MB copy), which would
+# a start->done span, which would
 # otherwise show up as the largest "exposed collective", count as 33 ms of
 # compute hiding any window it sits in, and tempt the fill/chase logic into
 # moving it. Both directions are excluded from every collective computation and
@@ -584,9 +579,7 @@ def _proto_effective_pos(
 # HLO text helpers (the phase-1 binding exposes little beyond name/opcode/
 # operands/users/to_string, so the rest is parsed from to_string())
 # ---------------------------------------------------------------------------
-# "parameter"/"constant" are leaves with no real dependency, so always movable
-# (job 3174209: their absence was the largest refusal reason blocking
-# all-gather-start.8.g3's chase).
+# "parameter"/"constant" are leaves with no real dependency, so always movable.
 _TRIVIAL_SINGLE_OPCODES = frozenset({
     "bitcast", "convert", "transpose", "reshape", "broadcast",
     "get-tuple-element", "tuple", "copy", "slice",
@@ -1120,9 +1113,8 @@ def _try_relocate_blocker_earlier(
        the heavy-compute chase): move straight to the floor if blocker's cost
        fits within the slack of every collective covering its position. Path 1
        is myopic across a chain: moving a small op a few positions looks like a
-       wash even when it is a necessary link to a candidate several hops away
-       (job 3179392, input_reduce_fusion.60). Path 2 can never push a fine
-       collective below its latency.
+       wash even when it is a necessary link to a candidate several hops away.
+       Path 2 can never push a fine collective below its latency.
 
     Moving a producer earlier never breaks its consumers; the risk is stealing
     overlap another collective relied on, which both gates guard against.
@@ -1192,11 +1184,6 @@ def _chase_ag_start_blocker_toward_heavy_compute(
     blocker earlier too, repeating until the blocker is a heavy anchor
     (_is_heavy_anchor_custom_call) or has no room.
 
-    _earliest_legal_pos stops at the first non-trivial producer and never asks
-    whether it can move, so "cannot move" can be misleading (job 3204236:
-    all-gather-start.8.g0 was pinned by te_dbias_quantize_ffi.* while an
-    unrelated GEMM sat comfortably earlier).
-
     Ungated (no net-exposure or margin check): an earlier gated version existed
     to protect other windows, but FSDP operand producers (quantize/dbias ops)
     are specific to that collective. If validation shows another collective
@@ -1243,10 +1230,9 @@ def _chase_exposed_collective_blocker_earlier(
     move that collective's start earlier, so it sits between the caller's window
     and the heavy-compute candidate it is blocking.
 
-    Narrower than the general recursive blocker chase (net-negative, job
-    3150632): it fires only for a real dependency on another exposed
-    collective's done. The move is capped at `window_done_pos` and bounded by
-    the chased start's own legal floor.
+    Narrower than the general recursive blocker chase it fires only for a
+    real dependency on another exposed collective's done. The move is capped at
+    `window_done_pos` and bounded by the chased start's own legal floor.
 
     Returns (changed, seq, positions, name_to_pos); unchanged if no move.
     """
@@ -1284,11 +1270,7 @@ def _find_relocatable_ancestor(
     skip_cheap_ancestors also requires cost >= _HEAVY_COMPUTE_MIN_US, so the
     walk passes over near-zero-cost connector ops (dynamic-slice/select
     fusions, a collective's own call-start/done) that the cost gate would
-    refuse anyway (job 3202509). It is enabled for while bodies only: applied
-    to `main` it found more relocations (79 -> 132) but made the final exposed
-    total worse (72,880 -> 83,724 us, job 3203932 vs 3202899), because
-    _find_best_blocker_position's per-hop approximation compounds over `main`'s
-    long chains. In while bodies it measured a net win.
+    refuse anyway.
 
     Returns the ancestor (possibly `inst`), or None if the chain bottoms out,
     cycles or exhausts max_depth.
@@ -1393,9 +1375,7 @@ def _compute_position_margins(
     infinite margin).
 
     Over-covered time is as safe to take from as idle time, as long as no more
-    than the slack is taken (job 3179259: te_gemm_v2_ffi.81/.87/.78/.84 sat in
-    all-gather-start.11's window with ~34 ms of slack and were wrongly
-    off-limits).
+    than the slack is taken.
 
     min_pos trims the work for a caller that only queries positions >= min_pos
     (the candidate scan, done_pos + 1). A caller that queries earlier
@@ -1431,10 +1411,9 @@ class _StuckCandidateTracker:
 
     - "none": never give up.
     - "streak": counts consecutive restarts blocked on the same candidate; a
-      different name resets it. Cheap and safest in small while bodies (job
-      3184713).
+      different name resets it. Cheap and safest in small while bodies.
     - "floor_aware": per-candidate, counting a repeat only if its floor failed
-      to improve. Better on the large entry computation (job 3187886), where
+      to improve. Better on the large entry computation, where
       multi-hop chains converge slowly.
     """
 
@@ -1486,8 +1465,7 @@ def _fill_exposed_collectives_with_heavy_compute(
     Outer fixed point (up to _MAX_FILL_FIXED_POINT_ITERS passes): each pass
     rebuilds the worklist from EVERY collective's fresh deficit, earliest start
     first, because filling or chasing one window can steal coverage from
-    another that was already hidden (job 3181428: call-start.2/.4/.38 and
-    all-gather-start.8.g2 became exposed purely as a side effect). A window
+    another that was already hidden. A window
     whose deficit is unchanged since the last pass was already scanned to
     exhaustion and is skipped. Stops when a pass changes nothing.
 
@@ -1623,8 +1601,7 @@ def _fill_exposed_collectives_with_heavy_compute(
                 continue
             window_siblings = sibling_ranges.get(window["start"].name, [])
             chase_hops = 0
-            # One window is drained fully before the next. Round-robin across
-            # windows caused more total churn (job 3191562 nearly timed out).
+            # One window is drained fully before the next.
             stuck_tracker = _StuckCandidateTracker(give_up_mode)
             given_up_candidates = set()
             while window["deficit"] > 0:
@@ -1855,8 +1832,7 @@ def _log_profile_coverage_gaps(module, schedule, module_name: str) -> None:
 
 # Which _GIVE_UP_MODES strategy won per computation, so the ~3x-cost comparison
 # runs once per _run_phase1_to_fixed_point call rather than on every re-entry
-# (re-comparing every time timed out, job 3188145). Cleared at the start of
-# each _run_phase1_to_fixed_point call.
+# Cleared at the start of each _run_phase1_to_fixed_point call.
 _fill_strategy_cache: dict[str, str] = {}
 
 
@@ -1874,15 +1850,9 @@ def _fill_exposed_collectives_best_of(
     """Run the fill with each _GIVE_UP_MODES strategy from the same baseline and
     keep the one with the lowest _total_exposed_us.
 
-    No strategy dominates: "streak" wins on small while bodies (job 3184713),
-    "floor_aware" on the large entry computation (job 3187886). Re-entries for
+    No strategy dominates: "streak" wins on small while bodies,
+    "floor_aware" on the large entry computation. Re-entries for
     a computation replay the cached winner with a single trial.
-
-    A per-window retry of stuck windows with the other modes was tried and
-    reverted (job 3193061, identical deficits): all-gather-start.8.g0/.g3's
-    candidates have a real dependency on all-gather-done.8.g2, a floor no
-    give-up policy moves. That is a consequence of how the split grouped
-    operands, not a fill gap.
     """
     cached_mode = _fill_strategy_cache.get(comp.name)
     if cached_mode is not None:
@@ -1936,8 +1906,7 @@ def _may_hoist_control_pred(pred, positions, comp_by_name) -> bool:
 
     Anything may, except the done of an FSDP or te_ep collective. The recursive
     hoist reached such a done through a consumer right after it and pulled it
-    next to its start (job 3213143's backward loop: reduce-scatter-done.1 from
-    322 to 96, leaving no compute in the window).
+    next to its start.
     """
     opc = _opcode_str(pred)
     if not (opc == "async-done" or opc.endswith("-done")):
@@ -1961,8 +1930,8 @@ def _simulate_comm_stream(order, cost: dict, lat: dict, done_start: dict, gate=N
     previous queued op; an async done stalls compute until its start has
     finished. Returns (total stall us, {done: stall us}).
 
-    NCCL collectives and te_ep calls share one stream (job 3212637), so a
-    collective issued behind a te_ep call waits for it and vice versa; the
+    NCCL collectives and custom comm calls share one stream, so a
+    collective issued behind a custom comm call waits for it and vice versa; the
     static window cost used elsewhere sees neither effect.
 
     `gate` is an optional set of SM-saturating GEMMs: a collective can't begin
@@ -2145,14 +2114,7 @@ def _hoist_fsdp_starts_to_floor(
 
     Runs after the fill step. The per-collective loop in _phase1_reorder skips a
     collective once its static window looks hidden, and later fill/chase moves
-    can land compute ahead of it with no dependency on it (job 3204509:
-    all-gather-start.9 sat after te_grouped_quantize_ffi.177.double_buffer_clone
-    and the dynamic_slice_fusion.25 GEMM). Its operand slices carry
-    control-predecessors (loop_add_fusion.9/10, bitcasts of earlier
-    all-gather-dones, DUS/async-done fusions) whose current positions set the
-    floor even though they could sit much earlier. So while a control-predecessor
-    pins the floor, hoist it to its own earliest legal position, then place the
-    start and its trivial operand chain.
+    can land compute ahead of it with no dependency on it.
 
     With the stream model on, placement is chosen by _best_fsdp_placement
     (which may also move the done); otherwise the start goes to its floor and
@@ -2693,11 +2655,7 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
 
         # Per-operand bytes: each sub-collective's latency is its byte share of
         # the original's PGLE latency (they have no profile entry of their own,
-        # so the post-split phase 1 would otherwise skip them). A byte-share
-        # "skip the split if a group looks too small" heuristic was tried and
-        # reverted: byte share doesn't predict downstream consumer count (job
-        # 3191924/3193061: g2 had the smallest share but 7 consumers, g0 an
-        # average share but 1).
+        # so the post-split phase 1 would otherwise skip them).
         _operand_bytes = [
             _proto_shape_bytes(id_to_inst[start_inst.operand_ids[i]].shape)
             for i in range(n_operands)
@@ -2954,9 +2912,7 @@ def _phase2_split_core(serialized_hlo: bytes, candidates: list[_SplitCandidate])
 
     # CreateFromProto builds computation_map incrementally, so every callee must
     # precede its caller. entry_comp may be a while body rather than the module
-    # entry and gains new callees (the sub-computations, appended at the end),
-    # so a "module entry last" rule is not enough (job 3203819: "all-gather-
-    # start.6.g0 instruction references invalid computation id(s)"). Post-order
+    # entry and gains new callees. Post-order
     # DFS over the call graph handles both cases.
     _id_to_proto_comp = {c.id: c for c in proto.computations}
     _visited: set[int] = set()
@@ -3207,9 +3163,7 @@ def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool
     schedule.update()/verify() (needed so XLA can canonicalize the schedule after
     raw seq mutations) can itself relocate an instruction whose dependency one
     of our earlier moves invalidated, without _phase1_reorder's bookkeeping
-    noticing, so a window scored hidden can end up exposed (job 3161055:
-    all-gather-start.9's window vanished after update() because
-    te_gemm_v2_ffi.93 depends on all-gather-done.8). Re-running phase 1 on the
+    noticing, so a window scored hidden can end up exposed. Re-running phase 1 on the
     post-update schedule re-fills it.
 
     Also used on a module straight out of phase 2: the split is pure proto
@@ -3229,9 +3183,7 @@ def _run_phase1_to_fixed_point(module, schedule, module_name: str) -> tuple[bool
         schedule.verify()
         module.set_schedule(schedule)
     else:
-        # Cap reached: the last update() was never rechecked (job 3188746: the
-        # fill's own ENTRY total said ~59,760 us but the final schedule had
-        # ~155,000 us exposed), so run one more pass.
+        # Cap reached: the last update() was never rechecked, so run one more pass.
         _logger.warning(
             "collective_overlap_pass [%s]: phase 1 fixed point not reached after %d iterations; "
             "running one final pass.",
