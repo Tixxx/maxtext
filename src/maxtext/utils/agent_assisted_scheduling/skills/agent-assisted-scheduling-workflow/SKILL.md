@@ -53,7 +53,7 @@ Related skills: `xla-gpu-scheduling-heuristics` (what XLA did),
 | Piece | State |
 |---|---|
 | Heuristic + legality knowledge | these skills |
-| Profile-guided reorderer | `collective_overlap_pass.py` (works as a `POST_SCHEDULER` pass) |
+| Profile-guided reorderer | `gpu_collective_overlap_pass.py` (works as a `POST_SCHEDULER` pass) |
 | Jax-free validator / cost / simulator library | **written**: `schedule_model.py`, `legality.py`, `placement.py`, `cost.py`, `simulate.py` in this directory, tested by `tests/unit/agent_assisted_scheduling_test.py` |
 | Adapter from `jax._src.lib.hlo.HloModule` + FDO profile to `schedule_model.Computation`, and a CLI | **not written** |
 | Plan format + plan-applying pass | **not written** |

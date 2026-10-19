@@ -56,7 +56,7 @@ way. That conservative rule is the safe default for an agent as well.
 
 ## Cross-rank safety
 
-- `_collective_overlap_pass` computes on rank 0 only and shares serialized
+- `_gpu_collective_overlap_pass` computes on rank 0 only and shares serialized
   module bytes through the JAX coordination KV store with entry/exit barriers,
   keyed by an invocation counter (content hashes were not stable across ranks).
   Any replacement pass must keep the property "all ranks compile identical

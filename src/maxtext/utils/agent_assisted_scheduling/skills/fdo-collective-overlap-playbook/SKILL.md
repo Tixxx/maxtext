@@ -1,6 +1,6 @@
 ---
 name: fdo-collective-overlap-playbook
-description: Profile-guided heuristics for hiding async collective latency on GPU, distilled from collective_overlap_pass.py (exposed-time metric, earliest legal start, blocker chasing, filling windows with heavy compute, comm-stream and SM-gating simulation, done placement, host-offload hoisting). Use when analysing a scheduled HLO plus a PGLE/FDO profile to decide which collectives to move and where.
+description: Profile-guided heuristics for hiding async collective latency on GPU, distilled from gpu_collective_overlap_pass.py (exposed-time metric, earliest legal start, blocker chasing, filling windows with heavy compute, comm-stream and SM-gating simulation, done placement, host-offload hoisting). Use when analysing a scheduled HLO plus a PGLE/FDO profile to decide which collectives to move and where.
 ---
 
 # FDO collective-overlap playbook

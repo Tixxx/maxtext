@@ -22,7 +22,7 @@ class AsyncRole(enum.Enum):
 
 
 # Ops that can be relocated without moving real compute. Mirrors
-# _TRIVIAL_SINGLE_OPCODES in collective_overlap_pass.py; fusions whose body is
+# _TRIVIAL_SINGLE_OPCODES in gpu_collective_overlap_pass.py; fusions whose body is
 # entirely trivial are flagged by the adapter via `Inst.trivially_movable`.
 TRIVIAL_OPCODES = frozenset({
     "bitcast", "convert", "transpose", "reshape", "broadcast",

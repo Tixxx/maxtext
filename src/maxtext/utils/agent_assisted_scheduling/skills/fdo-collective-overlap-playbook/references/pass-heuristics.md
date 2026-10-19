@@ -1,15 +1,15 @@
-# collective_overlap_pass.py: function map and constants
+# gpu_collective_overlap_pass.py: function map and constants
 
-File: `src/maxtext/utils/collective_overlap_pass.py` on branch
+File: `src/maxtext/utils/gpu_collective_overlap_pass.py` on branch
 `tixxx/experimental_custom_scheduling_pass` (2708 lines when this was written).
 
 ## Entry points
 
 | Function | Role |
 |---|---|
-| `register()` | registers `_collective_overlap_pass` as a `POST_SCHEDULER` transform via `jax.extend.xla.register_hlo_module_transformation`; disabled unless `COLLECTIVE_OVERLAP_DISABLE=0`; needs `COLLECTIVE_OVERLAP_XLA_PATH` to compile profile protos |
+| `register()` | registers `_gpu_collective_overlap_pass` as a `POST_SCHEDULER` transform named `gpu_collective_overlap_pass` via `jax.extend.xla.register_hlo_module_transformation`; disabled unless `COLLECTIVE_OVERLAP_DISABLE=0`; needs `COLLECTIVE_OVERLAP_XLA_PATH` to compile profile protos |
 | `_patch_pgle_profiler()` | hooks PGLE to capture the FDO bytes and the raw XSpace |
-| `_collective_overlap_pass(serialized_hlo)` | early-out if no async op; rank 0 computes, shares bytes via JAX KV store with barriers; returns `None` for "no change" |
+| `_gpu_collective_overlap_pass(serialized_hlo)` | early-out if no async op; rank 0 computes, shares bytes via JAX KV store with barriers; returns `None` for "no change" |
 | `_compute_collective_overlap` | rank-0 body: parse module, take schedule, run `_reorder_to_fixed_point`, serialize |
 | `_reorder_to_fixed_point` | loops `_reorder_collectives` (max `_MAX_REORDER_ITERS`=4) with `schedule.update()/verify()`, then `_hoist_host_offload_copy_starts` |
 

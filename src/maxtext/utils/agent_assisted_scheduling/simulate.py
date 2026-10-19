@@ -1,6 +1,6 @@
 """One-FIFO-comm-stream simulation of a schedule.
 
-Port of `_simulate_comm_stream` from collective_overlap_pass.py.
+Port of `_simulate_comm_stream` from gpu_collective_overlap_pass.py.
 
 Compute ops run back to back at their cost. Every comm-stream start is queued
 and begins at the later of its issue time and the end of the previously queued

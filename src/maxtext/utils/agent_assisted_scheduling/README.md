@@ -4,7 +4,7 @@ Skills that let a coding agent propose, check and apply better XLA:GPU
 schedules from an FDO (PGLE) profile. They distill two sources:
 
 - the profile-guided `POST_SCHEDULER` pass in
-  `src/maxtext/utils/collective_overlap_pass.py` (branch
+  `src/maxtext/utils/gpu_collective_overlap_pass.py` (branch
   `tixxx/experimental_custom_scheduling_pass`), and
 - XLA's own scheduler: `xla/service/gpu/gpu_hlo_schedule.cc`
   (`gpu_early_scheduling_rule`), `xla/service/gpu/gpu_latency_hiding_scheduler.cc`,
@@ -21,7 +21,7 @@ file names rather than line numbers, which drift; grep for them.
 | `skills/agent-assisted-scheduling-workflow` | Entry point: the analyze -> propose -> validate -> apply loop and what the agent must never do. |
 | `skills/xla-gpu-scheduling-heuristics` | Understand what XLA's latency hiding scheduler (LHS) does and why, so proposals complement it. |
 | `skills/xla-hlo-schedule-legality` | Know which schedules are illegal or unsafe before proposing one. |
-| `skills/fdo-collective-overlap-playbook` | Apply the profile-guided heuristics of `collective_overlap_pass.py`. |
+| `skills/fdo-collective-overlap-playbook` | Apply the profile-guided heuristics of `gpu_collective_overlap_pass.py`. |
 
 Each `SKILL.md` is short and links to `references/` for the detail.
 
@@ -38,7 +38,7 @@ agent (offline, or rank 0 only)           registered POST_SCHEDULER pass (all ra
 
 The agent never decides legality alone, and every rank must compile a
 byte-identical module (rank 0 computes, the others read it through the JAX
-distributed KV store, as `_collective_overlap_pass` does today).
+distributed KV store, as `_gpu_collective_overlap_pass` does today).
 
 ## Library
 

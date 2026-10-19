@@ -1,6 +1,6 @@
 """Where an async start may legally move to.
 
-Port of `_earliest_legal_pos` / `_reinsert` from collective_overlap_pass.py onto
+Port of `_earliest_legal_pos` / `_reinsert` from gpu_collective_overlap_pass.py onto
 the jax-free model.
 """
 
