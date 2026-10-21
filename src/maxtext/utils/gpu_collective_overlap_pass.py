@@ -403,6 +403,9 @@ _ASYNC_STREAM_TOL_US = float(os.environ.get("COLLECTIVE_OVERLAP_ASYNC_STREAM_TOL
 # COLLECTIVE_OVERLAP_SM_GATE_MIN_US are ignored.
 _SM_GATE = os.environ.get("COLLECTIVE_OVERLAP_SM_GATE", "1") != "0"
 _SM_GATE_MIN_US = float(os.environ.get("COLLECTIVE_OVERLAP_SM_GATE_MIN_US", "1000"))
+# COLLECTIVE_OVERLAP_GUARD_DONE_CONSUMERS=0 disables the done-consumer guard in
+# _fill_exposed_collectives_with_heavy_compute (see _done_consumer_headroom_loss).
+_GUARD_DONE_CONSUMERS = os.environ.get("COLLECTIVE_OVERLAP_GUARD_DONE_CONSUMERS", "1") != "0"
 
 
 def _opcode_str(inst) -> str:
@@ -1367,6 +1370,82 @@ def _chase_heavy_compute_blocker_chain(
   return changed, seq, positions, name_to_pos, floor, chain, blocker
 
 
+def _real_consumers_by_done(start_of_done: dict, comp_by_name: dict) -> tuple[dict, dict]:
+  """Real (non-trivial) consumers of every async done, both ways.
+
+  Returns (dones_of, consumers_of): dones_of maps a consumer to the dones it
+  consumes, consumers_of maps a done to its consumers. Looks through trivially
+  movable users (get-tuple-element, bitcast, ...), so for a combined collective
+  whose tuple elements feed different fusions, each of those fusions is a
+  consumer of the done.
+  """
+  dones_of: dict = {}
+  consumers_of: dict = {}
+  for async_done in start_of_done:
+    seen: set = set()
+    stack = list(async_done.users())
+    while stack:
+      user = stack.pop()
+      if user in seen:
+        continue
+      seen.add(user)
+      if _is_trivially_movable_inst(user, comp_by_name):
+        stack.extend(user.users())
+      else:
+        dones_of.setdefault(user, []).append(async_done)
+        consumers_of.setdefault(async_done, []).append(user)
+  return dones_of, consumers_of
+
+
+def _done_consumer_headroom_loss(
+    inst,
+    target: int,
+    dones_of: dict,
+    consumers_of: dict,
+    start_of_done: dict,
+    positions: dict,
+    prefix: list,
+    comp_by_name: dict,
+    window_start,
+) -> tuple[float, object]:
+  """Overlap (us) another collective loses if `inst` is moved to `target`.
+
+  A done can sink as far as its first real consumer, and that is where the
+  comm-stream model and _relocate_async_done_before_te_ep put it when the
+  collective is under-hidden. Moving a real consumer of a done earlier caps
+  that sinking, so the collective's reachable overlap shrinks even though its
+  current overlap, which _compute_position_margins looks at, is unchanged.
+  Reachable overlap is capped at the collective's latency: shrinking a window
+  that stays fully hidable costs nothing.
+
+  Returns (worst loss, the collective's start), or (0.0, None) if `inst`
+  consumes no other collective's done or none loses overlap.
+  """
+  worst, worst_start = 0.0, None
+  for async_done in dones_of.get(inst, ()):
+    async_start = start_of_done[async_done]
+    if async_start is window_start or async_start not in positions or async_done not in positions:
+      continue
+    latency = _profile_costs.get(_resolve_profile_key(async_start, comp_by_name))
+    if latency is None or latency <= 0:
+      continue
+    start_pos = positions[async_start]
+    others = [positions[c] for c in consumers_of[async_done] if c is not inst and c in positions]
+    bound_before = min(others + [positions[inst]])
+    bound_after = min(others + [target])
+    if bound_after >= bound_before:
+      continue
+
+    def reachable(bound: int) -> float:
+      done_pos = bound - 1
+      return min(latency, prefix[done_pos] - prefix[start_pos + 1]) if done_pos > start_pos + 1 else 0.0
+
+    loss = reachable(bound_before) - reachable(bound_after)
+    if loss > worst:
+      worst, worst_start = loss, async_start
+  return worst, worst_start
+
+
 def _compute_position_margins(
     start_of_done: dict,
     positions: dict,
@@ -1483,7 +1562,9 @@ def _fill_exposed_collectives_with_heavy_compute(
   its producer). Candidates are restricted to those whose cost fits within
   the slack of the collectives covering their position
   (_compute_position_margins), so a direct placement can never push another
-  collective below its latency. A candidate whose floor lies past `done` goes
+  collective below its latency. A candidate that consumes another collective's
+  done is also skipped when placing it would cap that done's reachable overlap
+  (_done_consumer_headroom_loss). A candidate whose floor lies past `done` goes
   to the chase fallbacks instead (see _chase_blocked).
 
   The deficit is recomputed from the real prefix sums on every iteration. An
@@ -1582,6 +1663,35 @@ def _fill_exposed_collectives_with_heavy_compute(
         return True
     return False
 
+  def _pins_other_done(inst, floor, window, start_pos, iter_prefix, dones_of, consumers_of) -> bool:
+    """True if moving `inst` to its target would cap how far another
+    collective's done can sink and lose that collective reachable overlap."""
+    if not dones_of:
+      return False
+    loss, hurt = _done_consumer_headroom_loss(
+        inst,
+        max(floor, start_pos + 1),
+        dones_of,
+        consumers_of,
+        start_of_done,
+        positions,
+        iter_prefix,
+        comp_by_name,
+        window["start"],
+    )
+    if hurt is None:
+      return False
+    _logger.debug(
+        "gpu_collective_overlap_pass [%s]: window %s: not placing %s: it consumes the done of %s and "
+        "would cap its reachable overlap (loss %.1f us).",
+        module_name,
+        window["start"].name,
+        inst.name,
+        hurt.name,
+        loss,
+    )
+    return True
+
   for _fp_iter in range(_MAX_FILL_FIXED_POINT_ITERS):
     pass_changed = False
 
@@ -1623,6 +1733,7 @@ def _fill_exposed_collectives_with_heavy_compute(
     # Only genuinely under-hidden collectives are chase targets, so
     # adequately overlapped ones aren't disturbed.
     exposed_dones = {w["done"] for w in windows}
+    dones_of, consumers_of = _real_consumers_by_done(start_of_done, comp_by_name) if _GUARD_DONE_CONSUMERS else ({}, {})
 
     # Windows can overlap in time; an instruction placed in a shared
     # zone counts toward both, so such placements are preferred. Best-effort
@@ -1693,6 +1804,8 @@ def _fill_exposed_collectives_with_heavy_compute(
                 restart = True
                 break
               continue
+            if _pins_other_done(inst, floor, window, start_pos, iter_prefix, dones_of, consumers_of):
+              continue
             if best_floor is None or floor < best_floor:
               best_floor = floor
               candidate = inst
@@ -1721,6 +1834,8 @@ def _fill_exposed_collectives_with_heavy_compute(
               if _chase_blocked(inst, floor, blocker, window, start_pos, done_pos, exposed_dones):
                 restart = True
                 break
+              continue
+            if _pins_other_done(inst, floor, window, start_pos, iter_prefix, dones_of, consumers_of):
               continue
             legal_candidates.append((inst, floor, chain, cost))
           if restart:
