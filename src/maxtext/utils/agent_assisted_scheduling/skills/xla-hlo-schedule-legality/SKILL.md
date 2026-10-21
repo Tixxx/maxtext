@@ -16,7 +16,13 @@ non-fusion computation:
 
 - every instruction appears **exactly once**, none missing, none extra;
 - every **operand** is scheduled before its user;
-- every **control predecessor** is scheduled before its user.
+- every **control predecessor** is scheduled before its user;
+- **no instruction leaves its computation** (strict, enforced by the validator
+  as `CROSS_COMPUTATION`): a plan for computation `c` may only contain
+  instructions of `c`. XLA's `Verify` would also reject the extra/missing
+  instruction, but the agent must never even propose a cross-computation move.
+  A moved instruction would otherwise be both MISSING in its own computation
+  and foreign in the other.
 
 `HloSchedule::Update` (what `schedule.update()` does) first re-sorts each
 sequence topologically, keeping your order where legal, then runs `Verify`.
@@ -62,9 +68,10 @@ tuple/gte/while/call/conditional/opt-barrier plumbing).
 - **Scheduling annotations.** Instructions with `_scheduling_group_id`
   (`LegalizeSchedulingAnnotations`) form a unit; do not split a group or insert
   non-group ops inside it unless you re-run the legalizer.
-- **Cross-loop and called computations.** A schedule is per computation. Moving
-  an instruction never crosses a while/conditional/call boundary; treat a
-  `while` as one instruction in its parent.
+- **Cross-loop and called computations.** A schedule is per computation and
+  instructions never move between computations (Layer 1, strict). Treat a
+  `while`, `call` or `conditional` as one instruction in its parent; hoisting
+  work out of a loop body is not a legal move for this flow.
 
 ## Layer 3: what runs after your pass
 
@@ -81,7 +88,8 @@ post-scheduling copy insertion, then registered `kPostScheduler` transforms
 
 ## Checklist before accepting a proposed schedule
 
-1. Same instruction set per computation; no duplicates.
+1. Same instruction set per computation; no duplicates; no instruction placed
+   in a computation other than its own.
 2. All data and control edges respected (run the verifier, do not eyeball).
 3. Every start precedes its done; the pair stays in one computation.
 4. If multi-streaming is on: no concurrent collectives with overlapping device groups. No cap on how many are in flight.

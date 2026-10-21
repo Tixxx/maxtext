@@ -24,10 +24,17 @@ Related skills: `xla-gpu-scheduling-heuristics` (what XLA did),
 
 1. **Collect.** Dump the scheduled module (`module.to_string()` of the module
    passed to the transform, post-LHS) and the FDO profile from
-   `module_config` (`fdo_profile`). Record the module name and a stable key
+   `module_config` (`fdo_profile`). Some PJRT plugins pass empty `module_config`
+   bytes; then read the profile XLA dumps with `--xla_dump_to=<dir>
+   --xla_gpu_experimental_dump_fdo_profiles`, which writes
+   `<module>.fdo_profile` as text. Record the module name and a stable key
    (instruction names are unique per module; do not hash the proto, a unique-id
    field differs per compile).
-2. **Analyze.** Per computation (innermost first): for each async start/done
+2. **Analyze.** Run `python -m maxtext.utils.agent_assisted_scheduling.cli analyze
+   <module>.hlo.pb --profile <module>.fdo_profile --json` (dump with
+   `--xla_dump_to`, `--xla_dump_hlo_as_proto=true`,
+   `--xla_gpu_experimental_dump_fdo_profiles=true`; take the
+   `*_gpu_after_optimizations.hlo.pb`). Per computation (innermost first): for each async start/done
    pair, compute latency, overlap, deficit; list blockers, heavy compute
    candidates, async-resource contention (one comm stream), and host-offload
    copies. Output a ranked exposed-collective table.
@@ -35,15 +42,24 @@ Related skills: `xla-gpu-scheduling-heuristics` (what XLA did),
    e.g. `{computation, move: <instruction>, to_before: <instruction>}`, with the
    playbook step and expected exposed-time change.
 4. **Validate.** Check the full proposed order against the legality checklist.
-   Reject, do not repair.
+   Reject, do not repair. `cli check-plan <module>.hlo.pb --profile ... --plan
+   plan.json` does validation and step 5 in one dry run; a rejected plan exits 1.
 5. **Simulate.** Estimate total exposed time with the comm-stream model (SM
    gating on) for before and after. Keep a move only if the total improves
    by more than noise (tolerance ~250 us in the existing pass).
-6. **Emit plan.** Per computation, the full ordered list of instruction names,
-   plus module name, profile identity and a checksum of the input order.
-7. **Apply (the pass).** Load the plan, check the checksum matches the module
-   being compiled, set the sequences, `schedule.update()`, `schedule.verify()`,
-   re-check device-group overlap if multi-streaming is on; on any mismatch return `None`.
+6. **Emit plan.** Write `{"computations": {"<computation>": [full order]}}` for
+   only the computations that change (optional `moves` notes), then run `cli
+   stamp-plan <module>.hlo.pb --profile ... --plan plan.json --out
+   stamped.json`. It refuses an illegal plan and otherwise adds module name,
+   `input_checksum` and the profile digest (`plan.py`). The stamped file is
+   canonical JSON: every rank reading it sees identical bytes, and
+   `Plan.digest()` is what ranks compare.
+7. **Apply (the pass).** `hlo_adapter.apply_plan(loaded, Plan.load(path),
+   identity=IdentityOptions(require_identity=True))`: checks name and checksum
+   against the module being compiled, validates, sets the sequences,
+   `schedule.update()`, `schedule.verify()`, re-checks device-group overlap if
+   multi-streaming is on; on any mismatch it leaves the module untouched and the
+   pass returns `None`.
 8. **Evaluate.** Run the real benchmark and compare step time with and without
    the plan, keeping XLA's schedule as the baseline. A better simulated total is
    a hypothesis, not a result.
@@ -55,14 +71,16 @@ Related skills: `xla-gpu-scheduling-heuristics` (what XLA did),
 | Heuristic + legality knowledge | these skills |
 | Profile-guided reorderer | `gpu_collective_overlap_pass.py` (works as a `POST_SCHEDULER` pass) |
 | Jax-free validator / cost / simulator library | **written**: `schedule_model.py`, `legality.py`, `placement.py`, `cost.py`, `simulate.py` in this directory, tested by `tests/unit/agent_assisted_scheduling_test.py` |
-| Adapter from `jax._src.lib.hlo.HloModule` + FDO profile to `schedule_model.Computation`, and a CLI | **not written** |
-| Plan format + plan-applying pass | **not written** |
+| Adapter from `jax._src.lib.hlo.HloModule` + FDO profile to `schedule_model.Module` (`hlo_adapter.load_module`), and writing a validated plan back (`hlo_adapter.apply_plan`) | **written**, tested on a handwritten module and a real 8-GPU compiled module; the profile loads from the text dump XLA writes (`profile.py`) |
+| CLI for the agent | **written**: `cli.py` (`analyze`, `check-plan`; dry run, never modifies a module) |
+| Plan format (`plan.py`: stamped canonical JSON, identity checks) | **written**, enforced by `check-plan`/`stamp-plan` and `apply_plan` |
+| Plan-applying `POST_SCHEDULER` pass | **not written** (`apply_plan` is its core) |
 | Replacing LHS | not possible with the current hooks: transforms run only at `kPreScheduler` / `kPostScheduler` (`xla/service/gpu/gpu_compiler.cc`), after LHS has run. Options: disable LHS with `xla_gpu_enable_latency_hiding_scheduler=false` and let the plan own the schedule (loses LHS memory/resource handling, which the validator must then provide), or add a scheduler-replacement hook in XLA. |
 
 ## Things the agent must not do
 
-- Edit or reorder across control edges, or move an instruction across a
-  computation boundary.
+- Edit or reorder across control edges, or move an instruction to a different
+  computation. Strictly never: `validate_plan` rejects it as `CROSS_COMPUTATION`.
 - Put a start immediately before its done (it becomes synchronous).
 - With collective multi-streaming on, overlap collectives whose device groups share more than one device.
 - Move an in-place writer relative to readers of the old buffer, or a D2H start

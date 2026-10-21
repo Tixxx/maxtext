@@ -1,7 +1,7 @@
 """Minimal, jax-free model of one scheduled HLO computation.
 
 The validator, cost and simulator modules operate on this model so they can be
-unit-tested without jaxlib or a GPU. An adapter (not written yet) builds it from
+unit-tested without jaxlib or a GPU. `hlo_adapter` builds it from
 `jax._src.lib.hlo.HloModule`, filling in costs from the FDO profile.
 
 Everything is keyed by instruction *name* (unique per module). A schedule for a
@@ -24,11 +24,21 @@ class AsyncRole(enum.Enum):
 # Ops that can be relocated without moving real compute. Mirrors
 # _TRIVIAL_SINGLE_OPCODES in gpu_collective_overlap_pass.py; fusions whose body is
 # entirely trivial are flagged by the adapter via `Inst.trivially_movable`.
-TRIVIAL_OPCODES = frozenset({
-    "bitcast", "convert", "transpose", "reshape", "broadcast",
-    "get-tuple-element", "tuple", "copy", "slice",
-    "parameter", "constant",
-})
+TRIVIAL_OPCODES = frozenset(
+    {
+        "bitcast",
+        "convert",
+        "transpose",
+        "reshape",
+        "broadcast",
+        "get-tuple-element",
+        "tuple",
+        "copy",
+        "slice",
+        "parameter",
+        "constant",
+    }
+)
 
 # Zero-cost plumbing: a start/done pair with only these between is converted to
 # a synchronous collective after scheduling (ConvertAsyncCollectivesToSync).
@@ -58,6 +68,8 @@ class Inst:
       that operand must keep its relative order with this instruction.
     device_groups: for collective STARTs, the participating device groups, as a
       tuple of frozensets of global device ids. None means unknown.
+    profile_key: for STARTs, the instruction name the latency is looked up under
+      in the FDO profile (the wrapped root, e.g. "all-gather.3.1").
   """
 
   name: str
@@ -72,6 +84,7 @@ class Inst:
   trivially_movable: Optional[bool] = None
   writes_operand: Optional[str] = None
   device_groups: Optional[tuple[frozenset, ...]] = None
+  profile_key: Optional[str] = None
 
   @property
   def is_trivially_movable(self) -> bool:
@@ -114,7 +127,8 @@ class Computation:
   def done_of(self, start_name: str) -> Optional[str]:
     """The DONE whose operand 0 is `start_name`, if exactly one exists."""
     dones = [
-        i.name for i in self.instructions.values()
+        i.name
+        for i in self.instructions.values()
         if i.async_role is AsyncRole.DONE and i.operands and i.operands[0] == start_name
     ]
     return dones[0] if len(dones) == 1 else None
@@ -128,6 +142,35 @@ class Computation:
         if done is not None:
           pairs.append((inst.name, done))
     return pairs
+
+
+@dataclass
+class Module:
+  """The scheduled (non-fusion) computations of one HLO module.
+
+  XLA instruction names are unique per module, so `owner` maps every instruction
+  to the single computation it lives in. That is what makes "no instruction
+  leaves its computation" checkable from names alone.
+  """
+
+  name: str
+  computations: dict[str, Computation] = field(default_factory=dict)
+  owner: dict[str, str] = field(init=False, default_factory=dict)
+
+  def __post_init__(self):
+    self.owner = {}
+    for comp in self.computations.values():
+      for inst_name in comp.instructions:
+        if inst_name in self.owner:
+          raise ValueError(
+              f"instruction name {inst_name!r} appears in both {self.owner[inst_name]!r} "
+              f"and {comp.name!r}; names must be unique per module"
+          )
+        self.owner[inst_name] = comp.name
+
+  @classmethod
+  def from_computations(cls, name: str, comps: list[Computation]) -> "Module":
+    return cls(name, {c.name: c for c in comps})
 
 
 def positions(order: list[str]) -> dict[str, int]:
