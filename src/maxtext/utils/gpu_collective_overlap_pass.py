@@ -379,6 +379,19 @@ _ASYNC_START_OPCODES = frozenset(
     }
 )
 
+# High-priority collectives: profile-key prefixes of the collectives the pass
+# must hide as much as it can. They get strict rules instead of being traded
+# for total exposure: no relocation or async placement may increase one's
+# exposure, and in the stream model their stall is minimized before the
+# simulated total. te_ep call-starts are not in the
+# list; they share the comm stream but yield to these.
+# COLLECTIVE_OVERLAP_PRIORITY_PREFIXES overrides it (comma-separated).
+_PRIORITY_COLLECTIVE_PREFIXES = tuple(
+    p.strip()
+    for p in os.environ.get("COLLECTIVE_OVERLAP_PRIORITY_PREFIXES", "all-gather,reduce-scatter,all-reduce").split(",")
+    if p.strip()
+)
+
 # COLLECTIVE_OVERLAP_WHILE_BODY_ONLY=1 skips the entry computation, which is by
 # far the largest sequence and dominates compile time.
 # Trades its overlap away for faster compiles.
@@ -829,6 +842,26 @@ def _total_exposed_us(
   return total
 
 
+def _priority_exposures(start_of_done: dict, seq: list, comp_by_name: dict) -> dict:
+  """Exposed us per high-priority collective (by start name) on `seq`."""
+  positions = {inst: i for i, inst in enumerate(seq)}
+  prefix = _prefix_costs_excluding(seq, (), comp_by_name)
+  out = {}
+  for async_done, async_start in start_of_done.items():
+    if async_start not in positions or async_done not in positions:
+      continue
+    key = _resolve_profile_key(async_start, comp_by_name)
+    if not key.startswith(_PRIORITY_COLLECTIVE_PREFIXES):
+      continue
+    latency = _profile_costs.get(key)
+    if latency is None or latency <= 0:
+      continue
+    s, d = positions[async_start], positions[async_done]
+    overlap = prefix[d] - prefix[s + 1] if d > s + 1 else 0.0
+    out[async_start.name] = max(0.0, latency - overlap)
+  return out
+
+
 def _earliest_legal_pos(
     async_start,
     positions: dict,
@@ -1163,7 +1196,26 @@ def _try_relocate_blocker_earlier(
 
   if target is None:
     return None
-  return _commit_sequence(schedule, comp, _reinsert(seq, chain, target, blocker))
+  new_seq = _reinsert(seq, chain, target, blocker)
+  # Strict rule: neither gate may pay for a gain elsewhere with a
+  # high-priority collective's overlap.
+  before = _priority_exposures(start_of_done, seq, comp_by_name)
+  after = _priority_exposures(start_of_done, new_seq, comp_by_name)
+  for name, exposed in after.items():
+    if exposed > before.get(name, 0.0) + 1e-6:
+      _logger.debug(
+          "gpu_collective_overlap_pass [%s]: TRC %s: pos %d -> %d rejected, priority collective %s "
+          "exposure %.1f -> %.1f us.",
+          module_name,
+          blocker.name,
+          blocker_pos,
+          target + len(chain),
+          name,
+          before.get(name, 0.0),
+          exposed,
+      )
+      return None
+  return _commit_sequence(schedule, comp, new_seq)
 
 
 def _chase_async_start_blocker_toward_heavy_compute(
@@ -2212,10 +2264,11 @@ def _best_async_placement(
   equal; among them the earliest start wins, then the latest done (largest
   window; a later done never adds a stall in the sim).
 
-  `protect` is an optional set of dones (the async-class ones): a candidate is
-  dropped if it raises their combined stall by more than the tolerance, so
-  trading one async collective's exposure for another's or a te_ep stall never
-  counts as a gain.
+  `protect` is an optional set of dones (the priority-class ones). A candidate
+  is dropped if it raises ANY one's simulated stall or its own static exposure, and
+  among the rest only those with the lowest combined priority stall compete on
+  simulated total, so a priority collective is never traded for a te_ep stall
+  or for another priority collective.
 
   Returns ((total, done_moved, base_idx), moved_chain, start_idx, done_idx, base)
   or None; indices are into `base` (seq without the moved instructions).
@@ -2231,10 +2284,17 @@ def _best_async_placement(
       [user_pos] + [positions[x] for x in ctrl_succs.get(async_start.name, []) if x in positions and x is not async_done]
   )
   cands = []
-  protected_now = 0.0
+  stalls_now: dict = {}
   if protect:
     _, stalls_now = _simulate_comm_stream(seq, cost, lat, done_start, gate)
-    protected_now = sum(stalls_now.get(d, 0.0) for d in protect)
+  # Static exposure of this start (compute between start and done vs latency).
+  # The simulator can call a window hidden only because compute was stalled on
+  # another collective in it; a priority collective must also not lose the
+  # overlap it has in compute alone.
+  is_priority = bool(protect) and async_done in protect and lat.get(async_start, 0.0) > 0
+  static_now = 0.0
+  if is_priority:
+    static_now = max(0.0, lat[async_start] - sum(cost.get(seq[j], 0.0) for j in range(start_pos + 1, done_pos)))
   chain = sorted(to_move, key=lambda x: positions[x])
   chain_pos = [positions[x] for x in chain]
   prepared: dict = {}
@@ -2275,18 +2335,32 @@ def _best_async_placement(
           continue
         order = base[:pb] + moved + [async_start] + base[pb:q] + [async_done] + base[q:]
         total, stalls = _simulate_comm_stream(order, cost, lat, done_start, gate)
-        if protect and sum(stalls.get(d, 0.0) for d in protect) > protected_now + _ASYNC_STREAM_TOL_US:
+        static_new = 0.0
+        if is_priority:
+          ps = pb + len(moved)
+          pd = ps + 1 + (q - pb)
+          static_new = max(0.0, lat[async_start] - sum(cost.get(x, 0.0) for x in order[ps + 1 : pd]))
+        if (protect and any(stalls.get(d, 0.0) > stalls_now.get(d, 0.0) + 1e-6 for d in protect)) or (
+            static_new > static_now + 1e-6
+        ):
           if diag is not None:
             diag.append((total, i, True))
           continue
         if diag is not None:
           diag.append((total, i, False))
-        cands.append((total, q != q_cur, pb, k, q, moved, base))
+        pstall = sum(stalls.get(d, 0.0) for d in protect) if protect else 0.0
+        cands.append((total, q != q_cur, pb, k, q, moved, base, pstall))
   if not cands:
     return None
+  # Priority collectives first: only candidates within tolerance of the lowest
+  # combined priority stall compete on simulated total.
+  pbest = min(c[7] for c in cands)
+  cands = [c for c in cands if c[7] <= pbest + 1e-6]
   limit = min(c[0] for c in cands) + _ASYNC_STREAM_TOL_US
-  total, _moved, pb, _, q, moved, base = min((c for c in cands if c[0] <= limit), key=lambda c: (c[2], -c[4]))
-  return ((round(total, 1), _moved, pb), moved, pb, q, base)
+  total, _moved, pb, _, q, moved, base, _ = min((c for c in cands if c[0] <= limit), key=lambda c: (c[2], -c[4]))
+  # key[3]: the chosen placement lowers the priority collectives' combined stall.
+  pnow = sum(stalls_now.get(d, 0.0) for d in protect) if protect else 0.0
+  return ((round(total, 1), _moved, pb, pbest + 1e-6 < pnow), moved, pb, q, base)
 
 
 # Recursion bound when hoisting a control-predecessor whose own latest operand
@@ -2374,7 +2448,7 @@ def _hoist_async_starts_to_floor(
         sim_lat[s_inst] = _collective_overrides.get(key_s) or _profile_costs.get(key_s, 0.0) or 0.0
         if key_s in _collective_overrides:
           n_lat_overridden += 1
-        if key_s.startswith(_ASYNC_COLLECTIVE_PREFIXES):
+        if key_s.startswith(_PRIORITY_COLLECTIVE_PREFIXES):
           async_dones.add(d_inst)
       except Exception:
         sim_lat[s_inst] = 0.0
@@ -2471,7 +2545,7 @@ def _hoist_async_starts_to_floor(
       )
       if best is not None:
         key, moved, pb, q, base = best
-        if key[0] <= before + _ASYNC_STREAM_TOL_US:
+        if key[0] <= before + _ASYNC_STREAM_TOL_US or key[3]:
           done_pos_old = positions[async_done]
           new_seq = base[:pb] + list(moved) + [async_start] + base[pb:q] + [async_done] + base[q:]
           if len(new_seq) == len(seq) and set(new_seq) == set(seq) and new_seq != seq:
