@@ -18,7 +18,11 @@ TO_APPLY_RE = re.compile(r"to_apply=%([A-Za-z0-9_.\-]+)")
 WHILE_BODY_RE = re.compile(r"\bbody=%([A-Za-z0-9_.\-]+)")
 CONTROL_PRED_RE = re.compile(r"control-predecessors=\{([^}]*)\}")
 CUSTOM_CALL_TARGET_RE = re.compile(r'custom_call_target="([^"]*)"')
-TE_GEMM_TARGET_RE = re.compile(r'custom_call_target="(te_grouped_gemm[^"]*|te_gemm[^"]*)"')
+# Custom-call targets of kernels that fill the SMs (GEMM, convolution, attention
+# families: cuBLAS/cuBLASLt, cuDNN, Triton/Transformer-Engine GEMMs, fused attention).
+GEMM_LIKE_TARGET_RE = re.compile(
+    r'custom_call_target="([^"]*(?:gemm|cublas|cudnn|matmul|conv|attn|attention|fmha|flash)[^"]*)"', re.IGNORECASE
+)
 
 # Memory space S(5) is pinned host memory; D2H/H2D offload copies touch it.
 HOST_MEMORY_SPACE_TAG = ":S(5)"

@@ -14,8 +14,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from maxtext.utils.agent_assisted_scheduling.cost import coverage_gaps, total_exposed_us
-from maxtext.utils.agent_assisted_scheduling.legality import Violation, errors, validate_plan
+from maxtext.utils.agent_assisted_scheduling.legality import Severity, Violation, errors, validate_plan
 from maxtext.utils.agent_assisted_scheduling.plan import IdentityOptions, Plan, verify_against
+from maxtext.utils.agent_assisted_scheduling.priority import (
+    DEFAULT_PRIORITY_PREFIXES,
+    PriorityRegression,
+    is_priority,
+    priority_regressions,
+    reachable_overlap_us,
+)
 from maxtext.utils.agent_assisted_scheduling.placement import earliest_legal_pos, hoist_start_to_floor
 from maxtext.utils.agent_assisted_scheduling.schedule_model import Computation, Module, positions
 from maxtext.utils.agent_assisted_scheduling.profile import Profile
@@ -40,6 +47,9 @@ class CollectiveRow:
   hoist_to: Optional[int]
   blocker: Optional[str]
   control_pins: tuple[str, ...]
+  priority: bool = False
+  # Deficit if the done sank to its first real consumer (None when unprofiled).
+  reachable_deficit_us: Optional[float] = None
 
   @property
   def can_hoist(self) -> bool:
@@ -59,6 +69,11 @@ class ComputationReport:
   rows: tuple[CollectiveRow, ...]
   gaps: tuple[str, ...] = ()
 
+  @property
+  def priority_exposed_us(self) -> float:
+    """Summed static deficit of the priority collectives."""
+    return sum(r.deficit_us for r in self.rows if r.priority)
+
 
 @dataclass(frozen=True)
 class ModuleReport:
@@ -75,6 +90,36 @@ class ModuleReport:
   def sim_stall_us(self) -> float:
     return sum(c.sim_stall_us for c in self.computations)
 
+  @property
+  def priority_exposed_us(self) -> float:
+    return sum(c.priority_exposed_us for c in self.computations)
+
+  def suspicious_latencies(
+      self, factor: float = 10.0, min_us: float = 5000.0, min_peers: int = 4
+  ) -> list[tuple[str, str, float, float]]:
+    """(computation, start, latency_us, median_us) of collectives far slower than their peers.
+
+    Peers are the profiled collectives of the same kind (the start's name up to
+    "-start"). A latency this far above the median is usually cross-rank skew or
+    startup, not time the collective needs, so its "exposure" cannot be fixed by
+    reordering; check it before building a plan on it.
+    """
+    by_kind: dict[str, list[float]] = {}
+    for c in self.computations:
+      for r in c.rows:
+        if r.profiled:
+          by_kind.setdefault(r.start.split("-start")[0], []).append(r.latency_us)
+    out = []
+    for c in self.computations:
+      for r in c.rows:
+        peers = by_kind.get(r.start.split("-start")[0], []) if r.profiled else []
+        if len(peers) < min_peers:
+          continue
+        median = sorted(peers)[len(peers) // 2]
+        if r.latency_us >= min_us and r.latency_us > factor * median:
+          out.append((c.name, r.start, r.latency_us, median))
+    return out
+
   def ranked(self, min_deficit_us: float = 0.0) -> list[tuple[str, CollectiveRow]]:
     """(computation, row) pairs, profiled rows with a deficit first, largest first.
 
@@ -85,7 +130,14 @@ class ModuleReport:
     return sorted(pairs, key=lambda p: (not p[1].profiled, -p[1].deficit_us, -p[1].sim_stall_us, p[1].start))
 
 
-def _row(comp: Computation, order: list[str], start: str, done: str, stalls: dict[str, float]) -> CollectiveRow:
+def _row(
+    comp: Computation,
+    order: list[str],
+    start: str,
+    done: str,
+    stalls: dict[str, float],
+    prefixes: tuple[str, ...] = DEFAULT_PRIORITY_PREFIXES,
+) -> CollectiveRow:
   pos = positions(order)
   inst = comp[start]
   latency = inst.latency_us
@@ -109,15 +161,22 @@ def _row(comp: Computation, order: list[str], start: str, done: str, stalls: dic
       hoist_to=new_pos if new_pos < pos[start] else None,
       blocker=elp.blocker,
       control_pins=tuple(name for _, name in elp.control_pins),
+      priority=is_priority(inst, prefixes),
+      reachable_deficit_us=max(0.0, latency - reachable_overlap_us(comp, order, start, done)) if profiled else None,
   )
 
 
 def analyze_computation(
-    comp: Computation, order: list[str], *, while_body: bool = False, sm_gate: bool = True
+    comp: Computation,
+    order: list[str],
+    *,
+    while_body: bool = False,
+    sm_gate: bool = True,
+    priority_prefixes: tuple[str, ...] = DEFAULT_PRIORITY_PREFIXES,
 ) -> ComputationReport:
   """Exposure report of `comp` scheduled as `order`."""
   sim = simulate_comm_stream(comp, order, sm_gate=sm_gate)
-  rows = tuple(_row(comp, order, s, d, sim.stalls) for s, d in comp.async_pairs())
+  rows = tuple(_row(comp, order, s, d, sim.stalls, priority_prefixes) for s, d in comp.async_pairs())
   return ComputationReport(
       name=comp.name,
       while_body=while_body,
@@ -136,6 +195,7 @@ def analyze_module(
     while_bodies: frozenset[str] = frozenset(),
     only: Optional[set[str]] = None,
     sm_gate: bool = True,
+    priority_prefixes: tuple[str, ...] = DEFAULT_PRIORITY_PREFIXES,
 ) -> ModuleReport:
   """Report every computation with an async pair (restricted to `only` if given)."""
   reports = []
@@ -144,7 +204,11 @@ def analyze_module(
       continue
     if not comp.async_pairs():
       continue
-    reports.append(analyze_computation(comp, orders[name], while_body=name in while_bodies, sm_gate=sm_gate))
+    reports.append(
+        analyze_computation(
+            comp, orders[name], while_body=name in while_bodies, sm_gate=sm_gate, priority_prefixes=priority_prefixes
+        )
+    )
   return ModuleReport(module.name, tuple(reports))
 
 
@@ -161,12 +225,18 @@ class ComputationDelta:
 
 @dataclass(frozen=True)
 class PlanReport:
-  """Outcome of checking a plan; `after` is None when the plan has errors."""
+  """Outcome of checking a plan.
+
+  `after` is None when the plan is illegal. A legal plan that makes a collective
+  worse (see priority.py) has `after` and `regressions` set and is rejected
+  unless `allow_priority_regression` was given.
+  """
 
   violations: tuple[Violation, ...]
   before: ModuleReport
   after: Optional[ModuleReport] = None
   deltas: tuple[ComputationDelta, ...] = field(default_factory=tuple)
+  regressions: tuple[PriorityRegression, ...] = field(default_factory=tuple)
 
   @property
   def accepted(self) -> bool:
@@ -183,8 +253,15 @@ def check_plan(
     while_bodies: frozenset[str] = frozenset(),
     check_device_groups: bool = False,
     sm_gate: bool = True,
+    priority_prefixes: tuple[str, ...] = DEFAULT_PRIORITY_PREFIXES,
+    allow_priority_regression: bool = False,
 ) -> PlanReport:
   """Validate `plan` and, if legal, compare exposure before and after.
+
+  A legal plan is still rejected (PRIORITY_REGRESSION errors) if it makes any
+  priority collective more exposed, raises its simulated stall, or shrinks the
+  overlap a collective could reach by sinking its done, even when the total
+  improves. `allow_priority_regression` downgrades those to warnings.
 
   `plan` is a `Plan` (its module/checksum/profile identity is checked first) or a
   bare {computation: order} dict (no identity; an error if `identity` requires it).
@@ -194,15 +271,29 @@ def check_plan(
   violations = tuple(verify_against(plan, module, baseline, profile, identity)) + tuple(
       validate_plan(module, plan.computations, baseline=baseline, check_device_groups=check_device_groups)
   )
-  before = analyze_module(module, baseline, while_bodies=while_bodies, sm_gate=sm_gate)
+  before = analyze_module(
+      module, baseline, while_bodies=while_bodies, sm_gate=sm_gate, priority_prefixes=priority_prefixes
+  )
   if errors(list(violations)):
     return PlanReport(violations, before)
   orders = {name: plan.computations.get(name, order) for name, order in baseline.items()}
-  after = analyze_module(module, orders, while_bodies=while_bodies, sm_gate=sm_gate)
+  after = analyze_module(
+      module, orders, while_bodies=while_bodies, sm_gate=sm_gate, priority_prefixes=priority_prefixes
+  )
+  regressions = tuple(
+      r
+      for name, order in orders.items()
+      if order != baseline[name]
+      for r in priority_regressions(module.computations[name], baseline[name], order, priority_prefixes, sm_gate=sm_gate)
+  )
+  severity = Severity.WARNING if allow_priority_regression else Severity.ERROR
+  violations = violations + tuple(
+      Violation("PRIORITY_REGRESSION", f"{r.computation}: {r.kind}: {r.message}", r.start, severity) for r in regressions
+  )
   after_by_name = {c.name: c for c in after.computations}
   deltas = tuple(
       ComputationDelta(c.name, c.static_exposed_us, a.static_exposed_us, c.sim_stall_us, a.sim_stall_us)
       for c in before.computations
       if (a := after_by_name.get(c.name)) is not None and orders[c.name] != baseline[c.name]
   )
-  return PlanReport(violations, before, after, deltas)
+  return PlanReport(violations, before, after, deltas, regressions)

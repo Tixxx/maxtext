@@ -60,3 +60,16 @@ def share(
   if client is not None:
     client.key_value_set_bytes(key, _MAGIC + payload)
   return payload
+
+
+def distributed_client() -> tuple[Optional[KvClient], int]:
+  """(client, rank) of the JAX distributed service; (None, 0) when single-process."""
+  try:
+    from jax._src import distributed  # pylint: disable=import-outside-toplevel
+
+    state = distributed.global_state
+    if state.client is not None and state.num_processes > 1:
+      return state.client, state.process_id
+  except Exception:  # pylint: disable=broad-exception-caught
+    pass
+  return None, 0

@@ -34,6 +34,12 @@ from maxtext.utils.agent_assisted_scheduling.plan import (
     profile_identity,
     verify_against,
 )
+from maxtext.utils.agent_assisted_scheduling.priority import (
+    DEFAULT_PRIORITY_PREFIXES,
+    PriorityRegression,
+    is_priority,
+    priority_regressions,
+)
 from maxtext.utils.agent_assisted_scheduling.profile import Profile
 from maxtext.utils.agent_assisted_scheduling.schedule_model import (
     AsyncRole,

@@ -77,6 +77,8 @@ from maxtext.utils import exceptions
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
+from maxtext.utils.agent_assisted_scheduling import aot_executable
+from maxtext.utils.agent_assisted_scheduling import module_exchange
 from maxtext.utils import maxtext_utils
 from maxtext.utils import qk_clip_utils
 from maxtext.utils import sharding
@@ -1545,6 +1547,8 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any]:
   train_utils.validate_train_config(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   jax.config.update("jax_remove_size_one_mesh_axis_from_type", config.remove_size_one_mesh_axis_from_type)
+  module_exchange.register()  # no-op unless COLLECTIVE_HLO_MODE is dump or load
+  aot_executable.register()  # no-op unless COLLECTIVE_AOT_MODE is dump or load
   os.environ["TFDS_DATA_DIR"] = config.dataset_path or ""
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):

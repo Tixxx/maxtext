@@ -325,17 +325,7 @@ def run_pass(
 _registered = False
 
 
-def _distributed_client():
-  """(client, rank) of the JAX distributed service; (None, 0) when single-process."""
-  try:
-    from jax._src import distributed  # pylint: disable=import-outside-toplevel
-
-    state = distributed.global_state
-    if state.client is not None and state.num_processes > 1:
-      return state.client, state.process_id
-  except Exception:  # pylint: disable=broad-exception-caught
-    pass
-  return None, 0
+_distributed_client = kv_share.distributed_client
 
 
 def register(config: Optional[PassConfig] = None, runner: Optional[agent_runner.AgentRunner] = None) -> bool:

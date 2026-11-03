@@ -21,7 +21,7 @@ from maxtext.utils.agent_assisted_scheduling import (
     total_exposed_us,
     validate_order,
 )
-from maxtext.utils.agent_assisted_scheduling import hlo_text
+from maxtext.utils.agent_assisted_scheduling import aot_bundle, aot_executable, hlo_text, module_exchange
 from maxtext.utils.agent_assisted_scheduling.analysis import analyze_module, check_plan
 from maxtext.utils.agent_assisted_scheduling.legality import Severity as _Sev
 from maxtext.utils.agent_assisted_scheduling.legality import validate_plan
@@ -33,6 +33,13 @@ from maxtext.utils.agent_assisted_scheduling.plan import (
     input_checksum,
     profile_identity,
     verify_against,
+)
+from maxtext.utils.agent_assisted_scheduling.priority import (
+    DEFAULT_PRIORITY_PREFIXES,
+    is_priority,
+    priority_regressions,
+    reachable_overlap_us,
+    real_consumers,
 )
 from maxtext.utils.agent_assisted_scheduling.profile import Profile
 from maxtext.utils.agent_assisted_scheduling.schedule_model import Module
@@ -568,6 +575,29 @@ class HloAdapterTest(absltest.TestCase):
     comp = next(c for c in hm.make_nonfusion_computations() if c.name == "main")
     self.assertEqual([i.name for i in sched.sequence(comp)], plan["main"])
 
+  def test_start_records_wrapped_opcode_so_priority_does_not_depend_on_names(self):
+    _, loaded = self._load()
+    start = loaded.module.computations["main"]["ag-start"]
+    self.assertEqual((start.profile_key, start.wrapped_opcode), ("ag", "all-gather"))
+    self.assertTrue(is_priority(start))
+
+  def test_sm_gate_ops_modes(self):
+    hm = _hlo.hlo_module_from_text(_TINY_HLO)
+    gate = lambda mode: {n: i.sm_gate for n, i in load_module(hm, Profile(), sm_gate_ops=mode).module.computations["main"].instructions.items()}
+    default = gate("gemm")
+    self.assertTrue(default["mm"] and default["mm2"])  # dot is SM-filling in any model, TE or not
+    self.assertFalse(default["ag-start"] or default["x"])
+    self.assertFalse(any(gate("none").values()))
+    every = gate("all")
+    self.assertTrue(every["mm"])
+    self.assertFalse(every["x"] or every["out"])  # parameters / tuple are trivially movable
+    with self.assertRaises(ValueError):
+      load_module(hm, Profile(), sm_gate_ops="bogus")
+    self.assertTrue(hlo_text.GEMM_LIKE_TARGET_RE.search('custom_call_target="__cublas$gemm"'))
+    self.assertTrue(hlo_text.GEMM_LIKE_TARGET_RE.search('custom_call_target="te_grouped_gemm_ffi"'))
+    self.assertTrue(hlo_text.GEMM_LIKE_TARGET_RE.search('custom_call_target="__cudnn$fmhaForward"'))
+    self.assertFalse(hlo_text.GEMM_LIKE_TARGET_RE.search('custom_call_target="te_dbias_quantize_ffi"'))
+
   def test_apply_rejects_control_order_violation_and_leaves_module_untouched(self):
     hm, loaded = self._load()
     plan = {"main": ["x", "w", "ag-start", "mm2", "mm", "ag-done", "out"]}
@@ -675,6 +705,92 @@ class AnalysisTest(absltest.TestCase):
     rep = check_plan(module, orders, {"main": list(orders["main"])})
     self.assertTrue(rep.accepted)
     self.assertEqual(rep.deltas, ())
+
+
+class PriorityTest(absltest.TestCase):
+  """Per-collective regression rules (priority.py)."""
+
+  def _comp(self, key="all-gather.1"):
+    """s(500 us) -> d -> g(get-tuple-element) -> c; a and b are 300 us of compute."""
+    return Computation.from_instructions(
+        "c",
+        [
+            _start("s", latency=500.0, profile_key=key),
+            _done("d", "s"),
+            Inst("g", "get-tuple-element", ("d",)),
+            _fus("c", ["g"], 10),
+            _fus("a", [], 300),
+            _fus("b", [], 300),
+        ],
+    )
+
+  def test_prefix_match_uses_profile_key_then_opcode(self):
+    comp = self._comp()
+    self.assertTrue(is_priority(comp["s"]))
+    self.assertFalse(is_priority(self._comp("te_ep_combine.2")["s"]))
+    self.assertTrue(is_priority(_start("x"), DEFAULT_PRIORITY_PREFIXES))  # no key: opcode all-gather-start
+    self.assertFalse(is_priority(comp["a"]))  # not a start
+    self.assertEqual(DEFAULT_PRIORITY_PREFIXES, ("all-gather", "reduce-scatter", "all-reduce"))
+
+  def test_real_consumers_look_through_trivial_users(self):
+    comp = self._comp()
+    self.assertEqual(real_consumers(comp, "d"), ["c"])
+    self.assertEqual(reachable_overlap_us(comp, ["s", "a", "b", "d", "g", "c"], "s", "d"), 500.0)  # capped at latency
+
+  def test_moving_a_consumer_earlier_is_a_reachable_regression_even_if_overlap_is_unchanged(self):
+    comp = self._comp()
+    before = ["s", "a", "d", "b", "g", "c"]  # overlap 300; b could still sink into the window
+    after = ["s", "a", "d", "g", "c", "b"]  # overlap 300; the consumer now caps the done
+    regs = priority_regressions(comp, before, after)
+    self.assertEqual([(r.kind, r.before_us, r.after_us) for r in regs], [("reachable", 0.0, 200.0)])
+
+  def test_exposed_regression_and_improvement(self):
+    comp = self._comp()
+    wide = ["s", "a", "b", "d", "g", "c"]
+    narrow = ["s", "a", "d", "b", "g", "c"]
+    self.assertEqual({r.kind for r in priority_regressions(comp, wide, narrow)}, {"exposed", "stall"})
+    self.assertEqual(priority_regressions(comp, narrow, wide), [])
+
+  def test_non_priority_collective_may_regress(self):
+    comp = self._comp("te_ep_combine.2")
+    self.assertEqual(priority_regressions(comp, ["s", "a", "b", "d", "g", "c"], ["s", "a", "d", "b", "g", "c"]), [])
+
+  def test_stall_is_summed_over_priority_collectives(self):
+    """One done may stall more if another stalls less by at least as much."""
+    comp = Computation.from_instructions(
+        "c",
+        [
+            _start("s1", latency=400.0, profile_key="all-gather.1"),
+            _done("d1", "s1"),
+            _start("s2", latency=400.0, profile_key="all-gather.2"),
+            _done("d2", "s2"),
+            _fus("a", [], 100),
+        ],
+    )
+    before = ["s1", "s2", "a", "d1", "d2"]
+    after = ["s1", "a", "s2", "d2", "d1"]
+    kinds = {r.kind for r in priority_regressions(comp, before, after)}
+    self.assertNotIn("stall", kinds)
+
+  def test_check_plan_rejects_and_allows(self):
+    comp = self._comp()
+    module = Module.from_computations("m", [comp])
+    baseline = {"c": ["s", "a", "b", "d", "g", "c"]}
+    plan = {"c": ["s", "a", "d", "b", "g", "c"]}
+    rep = check_plan(module, baseline, plan)
+    self.assertFalse(rep.accepted)
+    self.assertIsNotNone(rep.after)  # numbers are still reported
+    self.assertEqual({v.code for v in rep.violations if v.severity is _Sev.ERROR}, {"PRIORITY_REGRESSION"})
+    self.assertTrue(check_plan(module, baseline, plan, allow_priority_regression=True).accepted)
+    self.assertTrue(check_plan(module, baseline, plan, priority_prefixes=("collective-permute",)).accepted)
+
+  def test_analysis_rows_carry_priority_and_reachable_deficit(self):
+    comp = self._comp()
+    report = analyze_module(Module.from_computations("m", [comp]), {"c": ["s", "a", "d", "b", "g", "c"]})
+    (row,) = report.computations[0].rows
+    self.assertTrue(row.priority)
+    self.assertEqual((row.deficit_us, row.reachable_deficit_us), (200.0, 0.0))
+    self.assertEqual(report.priority_exposed_us, 200.0)
 
 
 class PlanTest(absltest.TestCase):
@@ -852,13 +968,28 @@ class CliTest(absltest.TestCase):
     self.assertIn("[no profile entry]", text)
 
   def test_check_plan_accepts_and_scores(self):
-    _write(self.plan, json.dumps({"computations": {"main": ["x", "w", "mm", "ag-start", "mm2", "ag-done", "out"]}}))
+    _write(self.plan, json.dumps({"computations": {"main": ["w", "x", "ag-start", "mm", "mm2", "ag-done", "out"]}}))
     status, text = self._run("check-plan", self.proto, "--profile", self.profile, "--plan", self.plan, "--json")
     self.assertEqual(status, 0)
     doc = json.loads(text)
     self.assertTrue(doc["accepted"])
     delta = doc["deltas"][0]
-    self.assertEqual((delta["static_before_us"], delta["static_after_us"]), (550.0, 650.0))
+    self.assertEqual((delta["static_before_us"], delta["static_after_us"]), (550.0, 550.0))
+
+  def test_check_plan_rejects_priority_regression_unless_allowed(self):
+    # Legal, but mm moves in front of ag-start, so the all-gather loses 100 us of overlap.
+    _write(self.plan, json.dumps({"computations": {"main": ["x", "w", "mm", "ag-start", "mm2", "ag-done", "out"]}}))
+    args = ("check-plan", self.proto, "--profile", self.profile, "--plan", self.plan)
+    status, text = self._run(*args)
+    self.assertEqual(status, 1)
+    self.assertIn("PRIORITY_REGRESSION", text)
+    self.assertIn("550.0 -> 650.0", text)
+    out = os.path.join(self.create_tempdir().full_path, "o.json")
+    stamp = ("stamp-plan", self.proto, "--profile", self.profile, "--plan", self.plan, "--out", out)
+    self.assertEqual(self._run(*stamp)[0], 1)
+    status, text = self._run(*args, "--allow-priority-regression")
+    self.assertEqual(status, 0, text)
+    self.assertIn("WARNING PRIORITY_REGRESSION", text)
 
   def test_check_plan_rejects_with_exit_1(self):
     _write(self.plan, json.dumps({"computations": {"main": ["x", "w", "ag-start", "mm2", "mm", "ag-done", "out"]}}))
@@ -874,7 +1005,7 @@ class CliTest(absltest.TestCase):
     self.assertIn("CROSS_COMPUTATION", text)
 
   def test_stamp_then_check_with_identity(self):
-    _write(self.plan, json.dumps({"computations": {"main": ["x", "w", "mm", "ag-start", "mm2", "ag-done", "out"]}}))
+    _write(self.plan, json.dumps({"computations": {"main": ["w", "x", "ag-start", "mm", "mm2", "ag-done", "out"]}}))
     stamped = os.path.join(self.create_tempdir().full_path, "stamped.json")
     status, text = self._run("stamp-plan", self.proto, "--profile", self.profile, "--plan", self.plan, "--out", stamped)
     self.assertEqual(status, 0, text)
@@ -895,7 +1026,7 @@ class CliTest(absltest.TestCase):
       )
 
   def test_check_plan_rejects_unstamped_when_required_and_stale_checksum(self):
-    _write(self.plan, json.dumps({"computations": {"main": ["x", "w", "mm", "ag-start", "mm2", "ag-done", "out"]}}))
+    _write(self.plan, json.dumps({"computations": {"main": ["w", "x", "ag-start", "mm", "mm2", "ag-done", "out"]}}))
     status, text = self._run("check-plan", self.proto, "--plan", self.plan, "--require-identity")
     self.assertEqual(status, 1)
     self.assertIn("PLAN_MISSING_IDENTITY", text)
@@ -905,7 +1036,7 @@ class CliTest(absltest.TestCase):
             {
                 "module": "tiny",
                 "input_checksum": "0" * 64,
-                "computations": {"main": ["x", "w", "mm", "ag-start", "mm2", "ag-done", "out"]},
+                "computations": {"main": ["w", "x", "ag-start", "mm", "mm2", "ag-done", "out"]},
             }
         ),
     )
@@ -931,6 +1062,351 @@ class CliTest(absltest.TestCase):
     _write(bad_plan, "[1, 2]")
     self.assertEqual(self._run("check-plan", self.proto, "--plan", bad_plan)[0], 2)
     self.assertEqual(self._run("analyze", self.proto, "--computation", "nope")[0], 2)
+
+
+# The all-gather starts after the compute that could have covered it.
+_LATE_START_HLO = _TINY_HLO.replace(
+    "  %ag-start = ((bf16[16,64]{1,0}), bf16[128,64]{1,0}) async-start(%x), calls=%async_comp\n", ""
+).replace(
+    "  %ag-done =",
+    "  %ag-start = ((bf16[16,64]{1,0}), bf16[128,64]{1,0}) async-start(%x), calls=%async_comp\n"
+    "  %mm3 = bf16[16,64]{1,0} dot(%mm2, %w), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n"
+    "  %ag-done =",
+).replace("tuple(%ag-done, %mm2)", "tuple(%ag-done, %mm3)")
+_LATE_START_PROFILE = (
+    'costs { name: "mm" cost_us: 100 }\ncosts { name: "mm2" cost_us: 250 }\n'
+    'costs { name: "mm3" cost_us: 100 }\ncosts { name: "ag" cost_us: 900 }\n'
+)
+
+
+@absltest.skipIf(_hlo is None, "jaxlib not available")
+class OptimizeAndExchangeTest(absltest.TestCase):
+  """`cli optimize --out-module` and the module_exchange dump / load transform."""
+
+  def setUp(self):
+    super().setUp()
+    self.dir = self.create_tempdir().full_path
+    self.module_bytes = _hlo.hlo_module_from_text(_LATE_START_HLO).as_serialized_hlo_module_proto()
+    self.module = os.path.join(self.dir, "late.pb")
+    self.profile = os.path.join(self.dir, "late.fdo_profile")
+    _write(self.module, self.module_bytes)
+    _write(self.profile, _LATE_START_PROFILE)
+
+  def _run(self, *argv):
+    out = io.StringIO()
+    return cli.main(list(argv), out=out), out.getvalue()
+
+  def _order(self, data: bytes) -> list[str]:
+    return load_module(_hlo.HloModule.from_serialized_hlo_module_proto(data), Profile()).baseline["main"]
+
+  def _optimized(self) -> str:
+    path = os.path.join(self.dir, "optimized.pb")
+    status, text = self._run(
+        "optimize", self.module, "--profile", self.profile, "--out-module", path, "--time-budget-s", "5"
+    )
+    self.assertEqual(status, 0, text)
+    return path
+
+  def test_optimize_writes_a_module_with_the_start_hoisted(self):
+    before = self._order(self.module_bytes)
+    self.assertLess(before.index("mm2"), before.index("ag-start"))
+    with open(self._optimized(), "rb") as f:
+      after = self._order(f.read())
+    self.assertLess(after.index("ag-start"), after.index("mm"))
+    self.assertLess(after.index("ag-start"), after.index("ag-done"))
+
+  def test_analyze_flags_a_latency_far_above_its_peers(self):
+    # Five all-gathers; one profiled at 50 ms against 1 ms for the rest.
+    comps = []
+    insts = [Inst("p", "parameter")]
+    for k in range(5):
+      lat = 50_000.0 if k == 0 else 1_000.0
+      insts += [
+          Inst(f"ag-start.{k}", "all-gather-start", ("p",), async_role=AsyncRole.START, latency_us=lat, uses_comm_stream=True, profile_key=f"ag{k}"),
+          Inst(f"ag-done.{k}", "all-gather-done", (f"ag-start.{k}",), async_role=AsyncRole.DONE),
+      ]
+    comp = Computation.from_instructions("main", insts)
+    report = analyze_module(Module.from_computations("m", [comp]), {"main": [i.name for i in insts]})
+    flagged = report.suspicious_latencies()
+    self.assertEqual([(c, s) for c, s, _, _ in flagged], [("main", "ag-start.0")])
+
+  def test_optimize_needs_an_output(self):
+    self.assertEqual(self._run("optimize", self.module, "--profile", self.profile)[0], 2)
+
+  def test_dump_then_optimize_dump_roundtrip(self):
+    dump = os.path.join(self.dir, "dump")
+    config = b""  # no profile in the config: the first compile of PGLE
+    stem = module_exchange.dump_module(self.module_bytes, config, dump, min_bytes=0)
+    self.assertTrue(stem.endswith("tiny.post_scheduler.0.hlo_module.pb"), stem)
+    out_module = os.path.join(self.dir, "from_dump.pb")
+    # Only a compile that had a profile is picked.
+    self.assertEqual(self._run("optimize-dump", dump, "--module-name", ".*", "--out-module", out_module)[0], 2)
+    _write(stem.replace(".hlo_module.pb", ".fdo_profile.txt"), _LATE_START_PROFILE)
+    status, text = self._run(
+        "optimize-dump", dump, "--module-name", ".*", "--out-module", out_module, "--time-budget-s", "5"
+    )
+    self.assertEqual(status, 0, text)
+    with open(out_module, "rb") as f:
+      self.assertLess(self._order(f.read()).index("ag-start"), self._order(self.module_bytes).index("ag-start"))
+
+  def test_dump_skips_small_and_unmatched_modules(self):
+    dump = os.path.join(self.dir, "dump")
+    self.assertIsNone(module_exchange.dump_module(self.module_bytes, b"", dump, min_bytes=10**9))
+    self.assertIsNone(module_exchange.dump_module(self.module_bytes, b"", dump, name_re="^nope$", min_bytes=0))
+    self.assertFalse(os.path.exists(dump))
+
+  def test_load_returns_the_file_only_for_the_matching_module(self):
+    optimized = self._optimized()
+    callback = module_exchange.make_callback(None, optimized)
+    with open(optimized, "rb") as f:
+      expected = f.read()
+    self.assertEqual(callback(self.module_bytes), expected)
+    # another module name: XLA keeps its schedule
+    other = _hlo.hlo_module_from_text(_LATE_START_HLO.replace("HloModule tiny", "HloModule other")).as_serialized_hlo_module_proto()
+    self.assertIsNone(callback(other))
+    # the same name, one instruction fewer: merged, and the result equals XLA's, so nothing changes
+    changed = _hlo.hlo_module_from_text(_TINY_HLO).as_serialized_hlo_module_proto()
+    self.assertIsNone(callback(changed))
+
+  def test_load_merges_an_instruction_the_optimized_file_does_not_have(self):
+    """A copy that appears in a later compile is slotted in; the optimized order is kept for the rest."""
+    optimized = self._optimized()
+    with_copy = _LATE_START_HLO.replace(
+        "  %ag-done =", "  %cp = bf16[16,64]{1,0} copy(%mm3)\n  %ag-done =", 1
+    ).replace("tuple(%ag-done, %mm3)", "tuple(%ag-done, %cp)")
+    data = _hlo.hlo_module_from_text(with_copy).as_serialized_hlo_module_proto()
+    out = module_exchange.make_callback(None, optimized)(data)
+    self.assertIsNotNone(out)
+    order = self._order(out)
+    self.assertIn("cp", order)
+    self.assertLess(order.index("ag-start"), order.index("mm"))  # the optimized order survived
+    self.assertLess(order.index("mm3"), order.index("cp"))
+
+  def test_load_refuses_when_too_many_instructions_differ(self):
+    optimized = self._optimized()
+    extra = "".join(f"  %c{k} = bf16[16,64]{{1,0}} copy(%mm3)\n" for k in range(20))
+    bigger = _LATE_START_HLO.replace("  %ag-done =", extra + "  %ag-done =", 1)
+    data = _hlo.hlo_module_from_text(bigger).as_serialized_hlo_module_proto()
+    self.assertIsNone(module_exchange.make_callback(None, optimized)(data))
+
+  def test_only_rank_zero_computes_and_every_rank_gets_the_same_bytes(self):
+    import threading  # pylint: disable=import-outside-toplevel
+
+    optimized = self._optimized()
+    store, cond = {}, threading.Condition()
+    barriers = {}
+
+    class FakeClient:
+
+      def key_value_set_bytes(self, key, value):
+        with cond:
+          store[key] = value
+          cond.notify_all()
+
+      def blocking_key_value_get_bytes(self, key, timeout_ms):
+        with cond:
+          assert cond.wait_for(lambda: key in store, timeout_ms / 1000), key
+          return store[key]
+
+      def wait_at_barrier(self, name, timeout_ms):
+        with cond:
+          barriers[name] = barriers.get(name, 0) + 1
+          cond.notify_all()
+          assert cond.wait_for(lambda: barriers[name] == 2, 10), name
+
+    client = FakeClient()
+    computed, results = [], {}
+    real = module_exchange.OptimizedModule.returns_for
+
+    def counting(self, data):
+      computed.append(threading.current_thread().name)
+      return real(self, data)
+
+    def rank(r):
+      callback = module_exchange.make_callback(None, optimized, distributed=lambda: (client, r))
+      results[r] = callback(self.module_bytes)
+
+    module_exchange.OptimizedModule.returns_for = counting
+    try:
+      threads = [threading.Thread(target=rank, args=(r,), name=f"rank{r}") for r in (1, 0)]
+      for t in threads:
+        t.start()
+      for t in threads:
+        t.join(30)
+    finally:
+      module_exchange.OptimizedModule.returns_for = real
+    self.assertEqual(computed, ["rank0"])
+    self.assertIsNotNone(results[0])
+    self.assertEqual(results[0], results[1])
+
+  def test_load_ignores_an_equal_schedule_and_survives_garbage(self):
+    callback = module_exchange.make_callback(None, self.module)  # the file equals XLA's input
+    self.assertIsNone(callback(self.module_bytes))
+    self.assertIsNone(callback(b"\x00garbage"))
+
+  def test_settings_pick_one_mode_and_check_its_path(self):
+    settings = module_exchange.settings
+    self.assertEqual(settings({}), ("off", ""))
+    self.assertEqual(settings({"COLLECTIVE_HLO_MODE": "off", "COLLECTIVE_HLO_PATH": "/x"}), ("off", "/x"))
+    self.assertEqual(settings({"COLLECTIVE_HLO_MODE": "DUMP", "COLLECTIVE_HLO_PATH": "/d"}), ("dump", "/d"))
+    self.assertEqual(settings({"COLLECTIVE_HLO_MODE": "load", "COLLECTIVE_HLO_PATH": self.module}), ("load", self.module))
+    with self.assertRaises(ValueError):
+      settings({"COLLECTIVE_HLO_MODE": "both", "COLLECTIVE_HLO_PATH": "/d"})
+    with self.assertRaises(ValueError):
+      settings({"COLLECTIVE_HLO_MODE": "dump"})
+    with self.assertRaises(FileNotFoundError):
+      settings({"COLLECTIVE_HLO_MODE": "load", "COLLECTIVE_HLO_PATH": os.path.join(self.dir, "missing.pb")})
+
+  def test_register_is_a_noop_when_the_mode_is_off(self):
+    old = {k: os.environ.pop(k, None) for k in (module_exchange.MODE_ENV, module_exchange.PATH_ENV)}
+    try:
+      self.assertFalse(module_exchange.register())
+      os.environ[module_exchange.MODE_ENV] = "off"
+      os.environ[module_exchange.PATH_ENV] = self.dir
+      self.assertFalse(module_exchange.register())
+    finally:
+      for k in old:
+        os.environ.pop(k, None)
+        if old[k] is not None:
+          os.environ[k] = old[k]
+
+
+def _varint(n: int) -> bytes:
+  out = bytearray()
+  while True:
+    byte = n & 0x7F
+    n >>= 7
+    out.append(byte | (0x80 if n else 0))
+    if not n:
+      return bytes(out)
+
+
+def _field(number: int, payload: bytes) -> bytes:
+  return _varint(number << 3 | 2) + _varint(len(payload)) + payload
+
+
+def _fake_header(params: int, outputs: int) -> bytes:
+  """A size-delimited metadata message with `params` parameter specs (field 6) and `outputs` output specs (field 5)."""
+  body = _field(2, b"pjrt_ifrt") + b"".join(_field(6, b"p") for _ in range(params)) + b"".join(_field(5, b"o") for _ in range(outputs))
+  return _varint(len(body)) + body
+
+
+_FAKE_XLA_COMPILE = """#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    --output_file=*) out="${a#--output_file=}";;
+    --module_config_file=*) cfg="${a#--module_config_file=}";;
+  esac
+done
+printf '%s\\n' "$@" > "$out.args"
+cp "$cfg" "$out.config"
+printf 'executable' > "$out"
+"""
+
+_DUMPED_CONFIG = """entry_computation_layout {
+  parameters {
+    element_type: F32
+  }
+}
+replica_count: 1
+num_partitions: 8
+debug_options {
+  xla_dump_to: "/original/dump"
+  xla_dump_hlo_as_text: true
+}
+"""
+
+
+class AotBundleTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.dir = self.create_tempdir().full_path
+    self.dump = os.path.join(self.dir, "dump")
+    os.makedirs(self.dump)
+    _write(os.path.join(self.dump, "jit_step.aot_header"), _fake_header(3, 2))
+    _write(os.path.join(self.dump, "module_5.jit_step.config.pbtxt"), _DUMPED_CONFIG)
+    _write(os.path.join(self.dump, "module_5.jit_step.autotune_results.pbtxt"), "")
+    _write(os.path.join(self.dump, "jit_step.post_scheduler.1.hlo_module.pb"), b"module")
+    _write(os.path.join(self.dump, "module_5.jit_step.after_spmd_partitioner.fdo_profile"), "profile")
+    self.optimized = os.path.join(self.dir, "optimized.pb")
+    _write(self.optimized, b"optimized")
+    self.compiler = os.path.join(self.dir, "xla_compile")
+    _write(self.compiler, _FAKE_XLA_COMPILE)
+    os.chmod(self.compiler, 0o755)
+    self.out = os.path.join(self.dir, "bundle")
+
+  def _build(self):
+    profile = os.path.join(self.dump, "module_5.jit_step.after_spmd_partitioner.fdo_profile")
+    return aot_bundle.build(self.dump, "jit_step", self.optimized, self.out, profile=profile, xla_compile=self.compiler)
+
+  def test_header_counts(self):
+    header = _fake_header(886, 893)
+    self.assertEqual(aot_bundle.header_spec_counts(header), (886, 893))
+    self.assertEqual(aot_bundle.header_of(header + b"payload"), header)
+    self.assertIsNone(aot_bundle.header_of(header[:-1]))
+
+  def test_build_compiles_the_scheduled_module_for_the_attached_gpu(self):
+    manifest = self._build()
+    executable = aot_bundle.executable_path(self.out, "jit_step")
+    args = open(executable + ".args", encoding="utf-8").read().split("\n")
+    self.assertIn(f"--module_file={self.optimized}", args)
+    self.assertIn("--use_attached_device", args)
+    self.assertIn("--platform=gpu", args)
+    self.assertTrue(any(a.startswith("--autotune_results=") and a.endswith("module_5.jit_step.autotune_results.pbtxt") for a in args))
+    config = open(executable + ".config", encoding="utf-8").read()
+    self.assertNotIn("entry_computation_layout", config)  # the dumped one is the global, pre-SPMD layout
+    self.assertNotIn("xla_dump_to", config)  # must not write into the original run's dump
+    self.assertIn("num_partitions: 8", config)
+    self.assertIn("xla_dump_hlo_as_text", config)
+    self.assertEqual((manifest.num_parameters, manifest.num_outputs, manifest.num_partitions), (3, 2, 8))
+    self.assertEqual(aot_bundle.check(self.out, "jit_step"), manifest)
+
+  def test_build_needs_the_header_and_the_binary(self):
+    os.remove(os.path.join(self.dump, "jit_step.aot_header"))
+    with self.assertRaisesRegex(aot_bundle.BundleError, "COLLECTIVE_AOT_MODE=dump"):
+      self._build()
+    _write(os.path.join(self.dump, "jit_step.aot_header"), _fake_header(1, 1))
+    with self.assertRaisesRegex(aot_bundle.BundleError, "xla_compile not found"):
+      aot_bundle.build(self.dump, "jit_step", self.optimized, self.out, xla_compile=os.path.join(self.dir, "missing"))
+
+  def test_check_rejects_a_bundle_that_is_not_what_it_says(self):
+    self._build()
+    with self.assertRaisesRegex(aot_bundle.BundleError, "not 'other'"):
+      aot_bundle.check(self.out, "other")
+    with self.assertRaisesRegex(aot_bundle.BundleError, "jaxlib"):
+      aot_bundle.check(self.out, "jit_step", current_jaxlib="0.0.0")
+    with open(aot_bundle.executable_path(self.out, "jit_step"), "ab") as f:
+      f.write(b"x")
+    with self.assertRaisesRegex(aot_bundle.BundleError, "does not match the manifest"):
+      aot_bundle.check(self.out, "jit_step")
+    os.remove(aot_bundle.header_path(self.out, "jit_step"))
+    with self.assertRaisesRegex(aot_bundle.BundleError, "missing"):
+      aot_bundle.check(self.out, "jit_step")
+    with self.assertRaisesRegex(aot_bundle.BundleError, "cannot read"):
+      aot_bundle.check(self.dir, "jit_step")
+
+  @absltest.skipIf(_hlo is None, "cli needs jaxlib")
+  def test_cli_build_and_check(self):
+    out = io.StringIO()
+    code = cli.main(
+        ["aot-build", self.dump, "--optimized-module", self.optimized, "--out-dir", self.out, "--module-name", "jit_step", "--xla-compile", self.compiler],
+        out=out,
+    )
+    self.assertEqual(code, 0, out.getvalue())
+    out = io.StringIO()
+    self.assertEqual(cli.main(["aot-check", self.out, "--module", "jit_step"], out=out), 0)
+    self.assertIn("ok: jit_step (3 parameters, 2 outputs)", out.getvalue())
+    out = io.StringIO()
+    self.assertEqual(cli.main(["aot-check", self.out, "--module", "other"], out=out), 1)
+    self.assertIn("not usable", out.getvalue())
+
+  def test_hook_settings(self):
+    self.assertEqual(aot_executable.settings({}), ("off", "", "jit_train_step"))
+    self.assertEqual(aot_executable.settings({"COLLECTIVE_AOT_MODE": "LOAD", "COLLECTIVE_AOT_PATH": "/b"}), ("load", "/b", "jit_train_step"))
+    self.assertEqual(aot_executable.settings({"COLLECTIVE_AOT_MODE": "dump"})[0], "off")  # no path
+    self.assertEqual(aot_executable.settings({"COLLECTIVE_AOT_MODE": "bogus", "COLLECTIVE_AOT_PATH": "/b"})[0], "off")
+    self.assertEqual(aot_executable.settings({"COLLECTIVE_AOT_MODE": "dump", "COLLECTIVE_AOT_PATH": "/d", "COLLECTIVE_AOT_MODULE": "m"}), ("dump", "/d", "m"))
 
 
 if __name__ == "__main__":

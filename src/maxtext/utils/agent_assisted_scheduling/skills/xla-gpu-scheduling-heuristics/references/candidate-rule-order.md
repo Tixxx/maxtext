@@ -43,7 +43,7 @@ Takeaways:
   hoist lengthens a collective's buffer lifetime; check memory (legality skill).
 - Everything after the early rule uses the PGLE costs only through ready time
   (`kLessStall`) and `kAvoidWaste`; there is no global search, which is the gap
-  the profile-guided pass fills.
+  a profile-guided reorder fills.
 
 ## Inferring the deciding rule without logs
 

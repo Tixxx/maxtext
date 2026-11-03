@@ -128,8 +128,9 @@ class LoadedModule:
 class _Loader:
   """Per-module state for turning binding instructions into `Inst`s."""
 
-  def __init__(self, hlo_module, profile: Profile):
+  def __init__(self, hlo_module, profile: Profile, sm_gate_ops: str = "gemm"):
     self.profile = profile
+    self.sm_gate_ops = sm_gate_ops
     self.comp_by_name = {c.name: c for c in hlo_module.computations()}
 
   def _callee(self, inst):
@@ -145,19 +146,22 @@ class _Loader:
     roots = [i for i in comp.instructions() if not list(i.users())]
     return roots[-1] if roots else None
 
-  def _unwrap(self, inst) -> str:
+  def _unwrap_inst(self, inst):
     for _ in range(_MAX_UNWRAP_HOPS):
       if _opcode(inst) not in ("call", "call-start", "async-start"):
-        return inst.name
+        return inst
       callee = self._callee(inst)
       root = self._root(callee) if callee is not None else None
       if root is None:
-        return inst.name
+        return inst
       inst = root
-    return inst.name
+    return inst
 
-  def profile_key(self, start) -> str:
-    """Name under which `start`'s latency is keyed in the profile."""
+  def _unwrap(self, inst) -> str:
+    return self._unwrap_inst(inst).name
+
+  def _wrapped_leaf(self, start):
+    """The instruction a start wraps (its async computation's root, unwrapped), or None."""
     root = None
     try:
       root = start.async_wrapped_root()
@@ -166,7 +170,17 @@ class _Loader:
     if root is None:
       callee = self._callee(start)
       root = self._root(callee) if callee is not None else None
-    return start.name if root is None else self._unwrap(root)
+    return None if root is None else self._unwrap_inst(root)
+
+  def profile_key(self, start) -> str:
+    """Name under which `start`'s latency is keyed in the profile."""
+    leaf = self._wrapped_leaf(start)
+    return start.name if leaf is None else leaf.name
+
+  def wrapped_opcode(self, start) -> Optional[str]:
+    """Opcode of the wrapped op ("all-gather", "custom-call", ...), None if unknown."""
+    leaf = self._wrapped_leaf(start)
+    return None if leaf is None else _opcode(leaf)
 
   def _fused_comp(self, inst):
     return self._callee(inst) if _opcode(inst) == "fusion" else None
@@ -191,17 +205,30 @@ class _Loader:
       return comp is not None and all(_opcode(i) in _TRIVIAL_FUSED_OPCODES for i in comp.instructions())
     return False
 
-  def is_te_gemm(self, inst) -> bool:
-    """A te_gemm/te_grouped_gemm custom call, or a kCustom fusion wrapping one."""
+  def _is_sm_filling(self, inst) -> bool:
+    """dot/convolution, or a custom call of a GEMM/convolution/attention kernel family."""
     opcode = _opcode(inst)
-    text = _text(inst)
-    if opcode == "custom-call":
-      return bool(hlo_text.TE_GEMM_TARGET_RE.search(text))
-    if opcode == "fusion" and "kind=kCustom" in text:
+    if opcode in ("dot", "convolution"):
+      return True
+    return opcode == "custom-call" and bool(hlo_text.GEMM_LIKE_TARGET_RE.search(_text(inst)))
+
+  def holds_sms(self, inst) -> bool:
+    """Whether `inst` can keep a collective from starting while it runs.
+
+    sm_gate_ops "gemm" (default): dot/convolution, GEMM-like custom calls, and
+    fusions wrapping either. "all": any non-trivial compute op (the simulator
+    still ignores ones cheaper than the gate threshold). "none": never.
+    """
+    mode = self.sm_gate_ops
+    if mode == "none":
+      return False
+    if mode == "all":
+      return not self.trivially_movable(inst)
+    if self._is_sm_filling(inst):
+      return True
+    if _opcode(inst) == "fusion":
       comp = self._fused_comp(inst)
-      return comp is not None and any(
-          _opcode(i) == "custom-call" and hlo_text.TE_GEMM_TARGET_RE.search(_text(i)) for i in comp.instructions()
-      )
+      return comp is not None and any(self._is_sm_filling(i) for i in comp.instructions())
     return False
 
   def host_copy(self, start) -> tuple[bool, bool]:
@@ -231,12 +258,13 @@ class _Loader:
     }
     if role is AsyncRole.NONE:
       kwargs["cost_us"] = self.cost_us(inst, False)
-      kwargs["sm_gate"] = self.is_te_gemm(inst)
+      kwargs["sm_gate"] = self.holds_sms(inst)
     else:
       kwargs["async_role"] = role
     if role is AsyncRole.START and not is_host_start:
       key = self.profile_key(inst)
       kwargs["profile_key"] = key
+      kwargs["wrapped_opcode"] = self.wrapped_opcode(inst)
       kwargs["latency_us"] = self.profile.cost(key) or None
       kwargs["uses_comm_stream"] = True
       kwargs["device_groups"] = hlo_text.parse_device_groups(text)
@@ -247,17 +275,25 @@ class _Loader:
     return Inst(**kwargs)
 
 
-def load_module(hlo_module, profile: Optional[Profile] = None) -> LoadedModule:
+SM_GATE_OPS = ("gemm", "all", "none")
+
+
+def load_module(hlo_module, profile: Optional[Profile] = None, sm_gate_ops: str = "gemm") -> LoadedModule:
   """Read a scheduled HloModule and an FDO profile into the library model.
+
+  `sm_gate_ops` picks which ops hold the SMs in the comm-stream simulation (see
+  `_Loader.holds_sms`): "gemm" (default), "all" or "none".
 
   Raises ValueError if the module has no schedule (nothing to reorder) or the
   schedule and the computation's instruction set disagree.
   """
+  if sm_gate_ops not in SM_GATE_OPS:
+    raise ValueError(f"sm_gate_ops must be one of {SM_GATE_OPS}, not {sm_gate_ops!r}")
   profile = profile or Profile()
   schedule = hlo_module.schedule()
   if schedule is None:
     raise ValueError(f"module {hlo_module.name} is not scheduled")
-  loader = _Loader(hlo_module, profile)
+  loader = _Loader(hlo_module, profile, sm_gate_ops)
   comps: list[Computation] = []
   baseline: dict[str, list[str]] = {}
   handles: dict[str, dict[str, Any]] = {}

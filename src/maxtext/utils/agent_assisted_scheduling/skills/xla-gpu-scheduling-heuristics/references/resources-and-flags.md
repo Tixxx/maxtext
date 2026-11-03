@@ -12,17 +12,12 @@ it at once beyond the limit.
 
 | Resource | Used by | Limit |
 |---|---|---|
-| `kGpuAsyncStreamCollectives` | NCCL collectives, custom collective calls, collective groups | `xla_gpu_experimental_parallel_collective_overlap_limit` (default 1) |
-| `kGpuAsyncStreamScaleUpCollectives` | collectives in the scale-up fabric domain | `..._parallel_scale_up_collective_overlap_limit` (0 = unlimited) |
+| `kGpuAsyncStreamCollectives` | NCCL collectives, custom collective calls, collective groups | the scheduler's per-resource limit (not a constraint on a plan) |
+| `kGpuAsyncStreamScaleUpCollectives` | collectives in the scale-up fabric domain | the scheduler's per-resource limit (not a constraint on a plan) |
 | `kGpuAsyncStreamComputes` | async compute (e.g. offload copy fusions, async wrapped compute) | `xla_gpu_experimental_parallel_async_compute_limit` (default 2) |
 | `kGpuAsyncStreamCollectivesP2P`, `Send0/1`, `Recv0/1` | send/recv and P2P-annotated collectives | effectively unlimited (`kNumAsyncCollectivesP2P`) |
 | `kGpuAsyncStreamMemcpy` | dynamic-slice D2D memcpy fusions | unlimited; `kSelective` hazard if selective memcpy overlap is on |
 | generic `kAllReduce`, `kCollectivePermute`, ... | `SchedulerConfig` per-kind limits | 1 each in `MakeGPUSchedulerConfig` |
-
-The code comment in `GetNumAvailableResources` explains the semantics: with
-limit 1 the scheduler emits `s0,e0,s1,e1`; with 2 it may emit `s0,s1,e0,e1`
-because it assumes the two do not interfere. More than 1 only helps if the
-runtime really issues them on separate streams.
 
 ## Device-overlap constraint (`GpuScheduleCrossesOverlapLimit`)
 
@@ -40,8 +35,6 @@ rationale when it is enabled, not as a general guarantee.
 | Flag (`DebugOptions`) | Meaning |
 |---|---|
 | `xla_gpu_enable_latency_hiding_scheduler` | explicit on/off for LHS |
-| `xla_gpu_experimental_collective_start_as_early_as_possible` (default false) | with limit > 1, turns on the compute-over-start rule |
-| `xla_gpu_experimental_parallel_collective_overlap_limit` | in-flight collectives |
 | `xla_gpu_experimental_parallel_async_compute_limit` | async compute (offload) overlap |
 | `xla_gpu_experimental_enable_selective_memcpy_overlap` | D2D memcpy overlap rule |
 | `xla_gpu_experimental_enable_collective_multi_streaming` | enables the device-overlap rule |

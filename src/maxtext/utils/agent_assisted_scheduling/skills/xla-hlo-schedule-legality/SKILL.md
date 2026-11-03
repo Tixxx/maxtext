@@ -24,10 +24,15 @@ non-fusion computation:
   A moved instruction would otherwise be both MISSING in its own computation
   and foreign in the other.
 
-`HloSchedule::Update` (what `schedule.update()` does) first re-sorts each
-sequence topologically, keeping your order where legal, then runs `Verify`.
-Note: it can silently relocate an instruction whose dependency your move broke,
-so a window you scored as hidden can end up exposed. Re-measure after `update`.
+`HloSchedule::Update` (what `schedule.update()` does) replays your order and
+postpones any instruction whose operand or control predecessor is not placed
+yet, emitting it right after that predecessor; it never moves the operand
+earlier, and everything depending on a postponed instruction is postponed with
+it. One early misplacement can therefore drag a whole downstream cluster away
+from where you put it, and a window you scored as hidden ends up exposed. A
+fully valid order is reproduced exactly, so never leave a violation in. The
+complete list of rules (membership, dependencies, async pairs, in-place writes,
+cross-rank order, side effects): `references/order-invariants.md`.
 
 HLO verifier async rules (`VerifyAsynchronousInstructionPairs`,
 `xla/service/hlo_verifier.cc`): an `async-done` traces back to exactly one
@@ -46,10 +51,8 @@ tuple/gte/while/call/conditional/opt-barrier plumbing).
   that rule only when `xla_gpu_experimental_enable_collective_multi_streaming`
   is on (or the module uses multiple collective domains). Without multi-streaming
   there is no such XLA constraint and the check should be off. The number of
-  collectives in flight is *not* a constraint either:
-  XLA's `xla_gpu_experimental_parallel_collective_overlap_limit` (default 1) is
-  a scheduler heuristic, and exceeding it is allowed when it makes a better
-  schedule.
+  collectives in flight is *not* a constraint: there is a single communication
+  stream.
 - **Send/recv chains.** Keep the control-edge order from
   `RunP2PSchedulePreparation` (`p2p_schedule_preparation.h`), e.g. recv => send
   => recv-done => send-done; pipelined chains have loop-carried order.
@@ -73,11 +76,11 @@ tuple/gte/while/call/conditional/opt-barrier plumbing).
   `while`, `call` or `conditional` as one instruction in its parent; hoisting
   work out of a loop body is not a legal move for this flow.
 
-## Layer 3: what runs after your pass
+## Layer 3: what runs after your plan is applied
 
 `RunPostSchedulingPipelines` (`xla/service/gpu/gpu_compiler.cc`) runs
 post-scheduling copy insertion, then registered `kPostScheduler` transforms
-(your pass), then:
+(where your plan is applied), then:
 
 - **async -> sync conversion** (`ConvertAsyncCollectivesToSync`): a start whose
   done has only no-op instructions between them is turned into a synchronous
@@ -88,12 +91,14 @@ post-scheduling copy insertion, then registered `kPostScheduler` transforms
 
 ## Checklist before accepting a proposed schedule
 
+0. Read `references/order-invariants.md` once; it is the full rule list.
 1. Same instruction set per computation; no duplicates; no instruction placed
    in a computation other than its own.
 2. All data and control edges respected (run the verifier, do not eyeball).
 3. Every start precedes its done; the pair stays in one computation.
 4. If multi-streaming is on: no concurrent collectives with overlapping device groups. No cap on how many are in flight.
-5. Host-offload and in-place ordering preserved.
+5. Host-offload and in-place ordering preserved; side-effecting ops keep their
+   original relative order; at least one real op between every start and done.
 6. Memory estimate within the scheduler limit, or compared against XLA's.
 7. Same result on every rank.
 8. On any failure, discard the whole proposal and keep XLA's schedule; never

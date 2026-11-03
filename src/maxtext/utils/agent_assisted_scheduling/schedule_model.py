@@ -60,7 +60,7 @@ class Inst:
       A done's operand 0 is its start.
     latency_us: profiled start->done latency of a START; None if not profiled.
     uses_comm_stream: a START that is queued on the (single) comm stream.
-    sm_gate: a large GEMM that holds the SMs; a collective cannot begin while it
+    sm_gate: a large SM-filling kernel (GEMM, convolution, attention) that holds the SMs; a collective cannot begin while it
       runs (see simulate.simulate_comm_stream).
     trivially_movable: override for the opcode-based default.
     writes_operand: name of an operand buffer this instruction updates in place
@@ -70,6 +70,9 @@ class Inst:
       tuple of frozensets of global device ids. None means unknown.
     profile_key: for STARTs, the instruction name the latency is looked up under
       in the FDO profile (the wrapped root, e.g. "all-gather.3.1").
+    wrapped_opcode: for STARTs, the opcode of the wrapped op ("all-gather",
+      "reduce-scatter", "custom-call", ...); None if unknown. Decides whether a
+      collective is a priority one (see priority.py), independent of naming.
   """
 
   name: str
@@ -85,6 +88,7 @@ class Inst:
   writes_operand: Optional[str] = None
   device_groups: Optional[tuple[frozenset, ...]] = None
   profile_key: Optional[str] = None
+  wrapped_opcode: Optional[str] = None
 
   @property
   def is_trivially_movable(self) -> bool:
@@ -135,13 +139,20 @@ class Computation:
 
   def async_pairs(self) -> list[tuple[str, str]]:
     """(start, done) name pairs, in no particular order."""
-    pairs = []
+    cached = self.__dict__.get("_pairs_cache")
+    if cached is not None and cached[0] == len(self.instructions):
+      return list(cached[1])
+    dones: dict[str, list[str]] = {}
     for inst in self.instructions.values():
-      if inst.async_role is AsyncRole.START:
-        done = self.done_of(inst.name)
-        if done is not None:
-          pairs.append((inst.name, done))
-    return pairs
+      if inst.async_role is AsyncRole.DONE and inst.operands:
+        dones.setdefault(inst.operands[0], []).append(inst.name)
+    pairs = [
+        (inst.name, dones[inst.name][0])
+        for inst in self.instructions.values()
+        if inst.async_role is AsyncRole.START and len(dones.get(inst.name, ())) == 1
+    ]
+    self.__dict__["_pairs_cache"] = (len(self.instructions), pairs)
+    return list(pairs)
 
 
 @dataclass

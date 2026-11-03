@@ -23,7 +23,7 @@ pass can improve. Details: `references/candidate-rule-order.md` (rule order),
    annotations, optional `SchedulerMemoryFencing`, then `LatencyHidingScheduler`
    with `DefaultSchedulerCore`.
 4. Later, `RunPostSchedulingPipelines` does post-schedule copy insertion, then
-   the registered `kPostScheduler` transforms (our pass), then
+   the registered `kPostScheduler` transforms (where a plan-applying transform runs), then
    async->sync conversion and rematerialization. See `xla-hlo-schedule-legality`.
 
 ## The scheduler in one paragraph
@@ -46,10 +46,9 @@ async-window heuristics. In order:
    memcpy window is open, prefer candidates "valuable for selective overlap"
    (non-memory-bound kernels): `kPreferComputeForD2DMemcpyOverlap`.
 2. If `aggressive_scheduling_policies` and `prioritize_compute_over_async_start`
-   (needs `parallel_collective_overlap_limit > 1` or the scale-up limit > 1
-   **and** `xla_gpu_experimental_collective_start_as_early_as_possible`; the
-   defaults in `debug_options_flags.cc` are limit 1 and the flag false, so this
-   branch is **off by default**):
+   (needs more than one parallel collective allowed **and**
+   `xla_gpu_experimental_collective_start_as_early_as_possible`; the flag
+   defaults to false, so this branch is **off by default**):
    - if either candidate occupies a resource (is a done), defer to later rules;
    - a candidate that releases a resource (is a start) and is not resource
      constrained is delayed in favour of plain compute:
@@ -99,13 +98,11 @@ alone does not identify the kind; look at the wrapped instruction.
   placement, infer which rules could have decided it from the scheduled module
   and the profile alone; `references/candidate-rule-order.md` ("Inferring the
   deciding rule without logs") lists what is observable.
-- LHS limits in-flight collectives by resource (`parallel_collective_overlap_limit`
-  defaults to 1): with limit 1 it emits `s0,e0,s1,e1`, never `s0,s1,e0,e1`.
-  A proposed schedule may exceed this limit; it is a heuristic, not a
-  correctness rule. The one XLA overlap constraint that is about safety, the
-  device-group overlap rule, is only installed when
+- There is a single communication stream, so the number of collectives in flight
+  is not something to limit. The one XLA overlap constraint that is about safety,
+  the device-group overlap rule, is only installed when
   `xla_gpu_experimental_enable_collective_multi_streaming` is on (or the module
   uses multiple collective domains); see `references/resources-and-flags.md`.
 - LHS cost is static per node; real GPUs also serialize NCCL kernels on one comm
-  stream and a large GEMM can hold the SMs. The profile-guided pass models that
-  (`fdo-collective-overlap-playbook`).
+  stream and a large GEMM can hold the SMs. The `analyze` command's `sim_stall`
+  models that (`fdo-collective-overlap-playbook`).
