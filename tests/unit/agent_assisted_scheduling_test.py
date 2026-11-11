@@ -4,6 +4,7 @@ import io
 import json
 import os
 import struct
+from unittest import mock
 
 from absl.testing import absltest
 
@@ -444,6 +445,28 @@ def _wire_cost(name, cost):
 
 
 class ProfileTest(absltest.TestCase):
+
+  def test_for_module_strips_fingerprint_and_drops_other_modules(self):
+    p = Profile({"aa::ag.1": 5.0, "bb::ag.1": 9.0, "ag.2": 2.0}, {("aa::s", "aa::d"): 4.0, ("bb::s", "bb::d"): 8.0})
+    q = p.for_module("aa")
+    self.assertEqual(q.costs, {"ag.1": 5.0, "ag.2": 2.0})
+    self.assertEqual(q.latencies, {("s", "d"): 4.0})
+
+  def test_for_module_unknown_fingerprint(self):
+    self.assertEqual(Profile({"aa::ag.1": 5.0}).for_module(None).costs, {"ag.1": 5.0})
+    with self.assertRaises(ValueError):
+      Profile({"aa::x": 1.0, "bb::x": 2.0}).for_module(None)
+    plain = Profile({"x": 1.0})
+    self.assertIs(plain.for_module("aa"), plain)
+
+  def test_module_fingerprint(self):
+    from maxtext.utils.agent_assisted_scheduling.profile import module_fingerprint
+
+    text = 'HloModule m, frontend_attributes={fingerprint_before_lhs="abc123"}\n'
+    self.assertEqual(module_fingerprint(text), "abc123")
+    self.assertIsNone(module_fingerprint("HloModule m\n"))
+    long_header = "HloModule m, entry_computation_layout={" + "f32[1]," * 20000 + '}, frontend_attributes={fingerprint_before_lhs="zz"}\n'
+    self.assertEqual(module_fingerprint(long_header), "zz")
 
   def test_binary(self):
     p = Profile.from_fdo_bytes(_wire_cost("all-gather.1", 12.5) + _wire_cost("f", 3.0))
@@ -1327,6 +1350,7 @@ class AotBundleTest(absltest.TestCase):
     _write(os.path.join(self.dump, "jit_step.aot_header"), _fake_header(3, 2))
     _write(os.path.join(self.dump, "module_5.jit_step.config.pbtxt"), _DUMPED_CONFIG)
     _write(os.path.join(self.dump, "module_5.jit_step.autotune_results.pbtxt"), "")
+    _write(os.path.join(self.dump, "module_5.jit_step.gpu_target_config.pbtxt"), "gpu_device_info {}")
     _write(os.path.join(self.dump, "jit_step.post_scheduler.1.hlo_module.pb"), b"module")
     _write(os.path.join(self.dump, "module_5.jit_step.after_spmd_partitioner.fdo_profile"), "profile")
     self.optimized = os.path.join(self.dir, "optimized.pb")
@@ -1346,12 +1370,13 @@ class AotBundleTest(absltest.TestCase):
     self.assertEqual(aot_bundle.header_of(header + b"payload"), header)
     self.assertIsNone(aot_bundle.header_of(header[:-1]))
 
-  def test_build_compiles_the_scheduled_module_for_the_attached_gpu(self):
+  def test_build_compiles_the_scheduled_module_without_a_gpu(self):
     manifest = self._build()
     executable = aot_bundle.executable_path(self.out, "jit_step")
     args = open(executable + ".args", encoding="utf-8").read().split("\n")
     self.assertIn(f"--module_file={self.optimized}", args)
-    self.assertIn("--use_attached_device", args)
+    self.assertNotIn("--use_attached_device", args)
+    self.assertTrue(any(a.startswith("--gpu_target_config=") and a.endswith("module_5.jit_step.gpu_target_config.pbtxt") for a in args))
     self.assertIn("--platform=gpu", args)
     self.assertTrue(any(a.startswith("--autotune_results=") and a.endswith("module_5.jit_step.autotune_results.pbtxt") for a in args))
     config = open(executable + ".config", encoding="utf-8").read()
@@ -1359,8 +1384,41 @@ class AotBundleTest(absltest.TestCase):
     self.assertNotIn("xla_dump_to", config)  # must not write into the original run's dump
     self.assertIn("num_partitions: 8", config)
     self.assertIn("xla_dump_hlo_as_text", config)
+    self.assertIn("xla_gpu_cudnn_deviceless_compilation_mode: CUDNN_DEVICELESS_COMPILATION_AUTO", config)
     self.assertEqual((manifest.num_parameters, manifest.num_outputs, manifest.num_partitions), (3, 2, 8))
     self.assertEqual(aot_bundle.check(self.out, "jit_step"), manifest)
+
+  def test_deviceless_cudnn_replaces_or_adds_the_mode(self):
+    auto = "xla_gpu_cudnn_deviceless_compilation_mode: CUDNN_DEVICELESS_COMPILATION_AUTO"
+    disabled = "debug_options {\n  xla_gpu_cudnn_deviceless_compilation_mode: CUDNN_DEVICELESS_COMPILATION_DISABLED\n  other: 1\n}\n"
+    self.assertEqual(aot_bundle._enable_deviceless_cudnn(disabled), f"debug_options {{\n  {auto}\n  other: 1\n}}\n")
+    self.assertEqual(aot_bundle._enable_deviceless_cudnn("debug_options {\n  other: 1\n}\n"), f"debug_options {{\n  {auto}\n  other: 1\n}}\n")
+    self.assertEqual(aot_bundle._enable_deviceless_cudnn("num_partitions: 8\n"), f"num_partitions: 8\ndebug_options {{\n  {auto}\n}}\n")
+
+  def _compile_args(self):
+    return open(aot_bundle.executable_path(self.out, "jit_step") + ".args", encoding="utf-8").read().split("\n")
+
+  def test_devices_per_host_comes_from_the_environment(self):
+    with mock.patch.dict(os.environ, {aot_bundle.DEVICES_PER_HOST_ENV: "8"}):
+      self._build()
+    self.assertIn("--num_devices_per_host=8", self._compile_args())
+
+  def test_devices_per_host_is_left_to_xla_compile_when_unset(self):
+    with mock.patch.dict(os.environ, {}, clear=False):
+      os.environ.pop(aot_bundle.DEVICES_PER_HOST_ENV, None)
+      self._build()
+    self.assertFalse(any(a.startswith("--num_devices_per_host") for a in self._compile_args()))
+
+  def test_devices_per_host_must_be_a_positive_integer(self):
+    for bad in ("eight", "0", "-4"):
+      with mock.patch.dict(os.environ, {aot_bundle.DEVICES_PER_HOST_ENV: bad}):
+        with self.assertRaisesRegex(aot_bundle.BundleError, aot_bundle.DEVICES_PER_HOST_ENV):
+          self._build()
+
+  def test_build_needs_the_target_config_of_run_1(self):
+    os.remove(os.path.join(self.dump, "module_5.jit_step.gpu_target_config.pbtxt"))
+    with self.assertRaisesRegex(aot_bundle.BundleError, "gpu_target_config.pbtxt"):
+      self._build()
 
   def test_build_needs_the_header_and_the_binary(self):
     os.remove(os.path.join(self.dump, "jit_step.aot_header"))
