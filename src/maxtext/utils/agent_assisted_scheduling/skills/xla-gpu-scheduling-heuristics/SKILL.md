@@ -81,14 +81,28 @@ alone does not identify the kind; look at the wrapped instruction.
 
 `ProfileGuidedLatencyEstimator` (`xla/service/profile_guided_latency_estimator.cc`):
 
-- `NodeCost(instr)`: profiled `cost_us` by **instruction name**; async
-  collective start/done nodes cost 1.0 (their time is latency, not node cost).
-  A miss falls back to the analytical GPU estimator.
-- `GetLatencyBetween(start, done)`: profiled start->done latency by name; for
-  an async start/done with no direct entry it retries with the wrapped
-  instruction's name; a miss falls back to the analytical estimate.
-- Instruction names must match the profiled module, so any renaming pass
-  between profiling and scheduling silently drops entries.
+- **Keys.** `gpu_hlo_schedule.cc` `FilterWithFingerprint`: a profile may hold
+  several modules, so each cost name is `<fingerprint>::<name>` where the
+  fingerprint is the module's `fingerprint_before_lhs` frontend attribute. Costs
+  of another fingerprint are ignored; an unprefixed cost applies to any module.
+  The name is the instruction's `OpMetadata.scheduling_name` (the name the
+  scheduler saw), not its final name: passes after scheduling rename some
+  instructions (e.g. `ConvertAsyncCollectivesToSync` turns `all-gather-start.33`
+  into a sync `all-gather.579`), and the profile still says `all-gather-start.33`.
+  Costs named `X.rematN` are averaged with `X`.
+- `NodeCost(instr)`: profiled `cost_us` by that key; async collective
+  start/done nodes cost 1.0 (their time is latency, not node cost). A miss falls
+  back to the analytical GPU estimator. `AllocateBuffer` custom calls cost 0.
+- `GetLatencyBetween(start, done)`: profiled start->done latency by key; for an
+  async start/done with no direct entry it retries with the wrapped
+  instruction's name. If that also misses: an async *call* is costed as the sum
+  of the costs of the instructions in the called computation, and an async
+  *fusion* (e.g. a dynamic-slice fusion) from the instructions inside it (so its
+  entry may sit under the wrapped custom call or collective, not the fusion). Only
+  then does it fall back to the analytical estimate.
+- Names must match the profiled module, so a renaming pass between profiling
+  and scheduling still drops entries unless the renamed instruction kept its
+  `scheduling_name`.
 
 `xla_gpu_pgle_accuracy_checker` (WARN/ERROR) reports profile misses.
 

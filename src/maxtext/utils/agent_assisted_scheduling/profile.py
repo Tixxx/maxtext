@@ -12,7 +12,14 @@ next to the HLO dumps (`<module>.fdo_profile` under --xla_dump_to, with
 
 Costs are keyed by *instruction name* (collectives under the name of their
 wrapped root, e.g. "all-gather.3.1", not the "all-gather-start" wrapper); a
-missing name means "not profiled", never "free". `module_config` handed to a
+missing name means "not profiled", never "free". Newer XLA changed two things:
+  * Keys carry the module fingerprint: "<fingerprint>::<name>", where the
+    fingerprint is the module's `fingerprint_before_lhs` frontend attribute. A
+    cost applies only to the module with that fingerprint; an unprefixed cost
+    applies to any module. Use `Profile.for_module` before looking names up.
+  * The name is the one the scheduler saw (`OpMetadata.scheduling_name`), which
+    differs from the final name for instructions renamed after scheduling (e.g.
+    a synchronous `all-gather.579` is keyed `all-gather-start.33`). `module_config` handed to a
 transform carries the profile as field 31 (`bytes fdo_profile`) of
 `HloModuleConfigProto` (xla/xla.proto); some PJRT plugins pass empty bytes there.
 """
@@ -25,6 +32,14 @@ from dataclasses import dataclass, field
 from typing import Iterator, Mapping
 
 _MODULE_CONFIG_FDO_PROFILE_FIELD = 31
+FINGERPRINT_SEP = "::"  # xla/service/hlo_profiling_utils.cc kCostNameSep
+_FINGERPRINT_RE = re.compile(r'fingerprint_before_lhs="([^"]*)"')
+
+
+def module_fingerprint(module_text: str) -> str | None:
+  """`fingerprint_before_lhs` of a printed HloModule (its frontend attribute), or None."""
+  m = _FINGERPRINT_RE.search(module_text.split("\n", 1)[0])  # the header line can be ~100 KB
+  return m.group(1) if m else None
 
 
 def _varint(buf: bytes, i: int) -> tuple[int, int]:
@@ -159,6 +174,46 @@ class Profile:
     for (src, tgt), lat in sorted(self.latencies.items()):
       lines.append(f'latencies {{ source: "{_escape(src)}" target: "{_escape(tgt)}" latency_us: {float(lat)!r} }}')
     return "\n".join(lines) + ("\n" if lines else "")
+
+  def fingerprints(self) -> set[str]:
+    """Module fingerprints that prefix cost names (empty for an unprefixed profile)."""
+    return {k.split(FINGERPRINT_SEP, 1)[0] for k in self.costs if FINGERPRINT_SEP in k}
+
+  def for_module(self, fingerprint: str | None) -> "Profile":
+    """The profile with names unprefixed, keeping only costs that apply to the module.
+
+    Mirrors XLA's `FilterWithFingerprint`: a cost prefixed with another module's
+    fingerprint is dropped, an unprefixed cost is kept. With `fingerprint=None`
+    (unknown) the prefix is stripped only if the profile holds a single
+    fingerprint; with several it is ambiguous, so raise rather than guess.
+    """
+    prints = self.fingerprints()
+    if not prints:
+      return self
+    if fingerprint is None:
+      if len(prints) > 1:
+        raise ValueError(
+            f"profile holds costs of {len(prints)} modules ({sorted(prints)}) and the module's "
+            "fingerprint_before_lhs is unknown; cannot choose which costs apply"
+        )
+      fingerprint = next(iter(prints))
+
+    def keep(table, names):
+      out = {}
+      for key, val in table.items():
+        parts = [k.split(FINGERPRINT_SEP, 1) for k in names(key)]
+        if any(len(p) == 2 and p[0] != fingerprint for p in parts):
+          continue
+        out[key] = val
+      return out
+
+    def strip(name: str) -> str:
+      head, sep, tail = name.partition(FINGERPRINT_SEP)
+      return tail if sep and head == fingerprint else name
+
+    costs = {strip(k): v for k, v in keep(self.costs, lambda k: (k,)).items()}
+    lats = {(strip(s), strip(t)): v for (s, t), v in keep(self.latencies, lambda k: k).items()}
+    return Profile(costs, lats)
 
   def cost(self, name: str) -> float:
     """Profiled cost, or 0.0 when the name is not profiled."""

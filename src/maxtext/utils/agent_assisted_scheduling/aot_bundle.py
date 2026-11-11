@@ -34,6 +34,7 @@ MANIFEST = "manifest.json"
 HEADER_SUFFIX = ".aot_header"
 EXECUTABLE_SUFFIX = ".aot_executable"
 XLA_COMPILE_ENV = "XLA_COMPILE_BIN"
+DEVICES_PER_HOST_ENV = "COLLECTIVE_AOT_DEVICES_PER_HOST"
 
 
 class BundleError(Exception):
@@ -135,8 +136,23 @@ def _strip_entry_layout_and_dump(config_text: str) -> str:
   return "\n".join(out)
 
 
-def _dumped_compile_files(dump_dir: str, module: str, profile: Optional[str]) -> tuple[str, Optional[str]]:
-  """(module config, autotune results or None) of the compile the optimized module came from."""
+def _devices_per_host(devices_per_host: Optional[int]) -> int:
+  """GPUs per host for the deviceless topology: the argument, else $COLLECTIVE_AOT_DEVICES_PER_HOST, else 0 (unset)."""
+  if devices_per_host is None:
+    raw = os.environ.get(DEVICES_PER_HOST_ENV, "").strip()
+    if not raw:
+      return 0
+    try:
+      devices_per_host = int(raw)
+    except ValueError:
+      devices_per_host = 0
+    if devices_per_host <= 0:
+      raise BundleError(f"{DEVICES_PER_HOST_ENV} must be a positive integer, got {raw!r}")
+  return max(devices_per_host, 0)
+
+
+def _dumped_compile_files(dump_dir: str, module: str, profile: Optional[str]) -> tuple[str, Optional[str], str]:
+  """(module config, autotune results or None, GPU target config) of the compile the optimized module came from."""
   module_id = None
   if profile:
     m = re.match(r"module_(\d+)\.", os.path.basename(profile))
@@ -151,7 +167,29 @@ def _dumped_compile_files(dump_dir: str, module: str, profile: Optional[str]) ->
   if not configs:
     raise BundleError(f"no module_*.{module}.config.pbtxt in {dump_dir}")
   autotune = configs[0].replace(".config.pbtxt", ".autotune_results.pbtxt")
-  return configs[0], autotune if os.path.exists(autotune) else None
+  target = configs[0].replace(".config.pbtxt", ".gpu_target_config.pbtxt")
+  if not os.path.exists(target):
+    raise BundleError(f"no {os.path.basename(target)} in {dump_dir}: run 1 needs --xla_dump_to")
+  return configs[0], autotune if os.path.exists(autotune) else None, target
+
+
+_CUDNN_DEVICELESS_RE = re.compile(r"^(\s*)xla_gpu_cudnn_deviceless_compilation_mode:.*$", re.M)
+_CUDNN_DEVICELESS_AUTO = "CUDNN_DEVICELESS_COMPILATION_AUTO"
+
+
+def _enable_deviceless_cudnn(config_text: str) -> str:
+  """The module config with cuDNN graphs compiled without a device.
+
+  Run 1's config says `CUDNN_DEVICELESS_COMPILATION_DISABLED`, and then a compile with no device skips building the
+  cuDNN graphs (fused attention) altogether: it succeeds, and the executable fails at its first step with "No
+  serialized cuDNN graph with fingerprint ...". Needs cuDNN 9.23 or newer.
+  """
+  setting = f"xla_gpu_cudnn_deviceless_compilation_mode: {_CUDNN_DEVICELESS_AUTO}"
+  if _CUDNN_DEVICELESS_RE.search(config_text):
+    return _CUDNN_DEVICELESS_RE.sub(lambda m: f"{m.group(1)}{setting}", config_text)
+  if "debug_options {" in config_text:
+    return config_text.replace("debug_options {", f"debug_options {{\n  {setting}", 1)
+  return config_text.rstrip("\n") + f"\ndebug_options {{\n  {setting}\n}}\n"
 
 
 def _num_partitions(config_text: str) -> int:
@@ -166,13 +204,16 @@ def build(
     out_dir: str,
     profile: Optional[str] = None,
     xla_compile: Optional[str] = None,
+    devices_per_host: Optional[int] = None,
 ) -> Manifest:
   """Compiles `optimized_module` with `xla_compile` and writes the bundle for `module` into `out_dir`.
 
   `dump_dir` is the COLLECTIVE_AOT_MODE=dump directory of run 1 (it holds the header and the XLA dumps of the
   compile). `profile` is the FDO profile file `optimize-dump` used; it names the compile whose config to reuse.
-  Compiles on the attached GPU: deviceless `xla_compile` builds a one-host topology that rejects multi-device
-  collectives.
+  The compile needs no GPU: it uses run 1's GPU target config. `devices_per_host` (default
+  $COLLECTIVE_AOT_DEVICES_PER_HOST) is the number of GPUs on each node and decides which collectives count as local to
+  a host; unset, `xla_compile` assumes every partition is on one host, which is right for a single node only. It
+  needs an `xla_compile` with the `--num_devices_per_host` flag.
   """
   header = header_path(dump_dir, module)
   if not os.path.exists(header):
@@ -183,25 +224,28 @@ def build(
         "xla_compile not found: pass --xla-compile or set XLA_COMPILE_BIN; build it with "
         "`build-jax.sh --no-install --extra-targets=@xla//xla/service:xla_compile --extra-target-dest=DIR`"
     )
-  config, autotune = _dumped_compile_files(dump_dir, module, profile)
+  config, autotune, target_config = _dumped_compile_files(dump_dir, module, profile)
   with open(config, encoding="utf-8") as f:
     config_text = f.read()
 
   os.makedirs(out_dir, exist_ok=True)
   compile_config = os.path.join(out_dir, module + ".compile_config.pbtxt")
   with open(compile_config, "w", encoding="utf-8") as f:
-    f.write(_strip_entry_layout_and_dump(config_text))
+    f.write(_enable_deviceless_cudnn(_strip_entry_layout_and_dump(config_text)))
   executable = executable_path(out_dir, module)
   cmd = [
       binary,
       f"--module_file={optimized_module}",
       f"--module_config_file={compile_config}",
-      "--use_attached_device",
+      f"--gpu_target_config={target_config}",
       "--platform=gpu",
       f"--output_file={executable}",
   ]
   if autotune:
     cmd.append(f"--autotune_results={autotune}")
+  per_host = _devices_per_host(devices_per_host)
+  if per_host:
+    cmd.append(f"--num_devices_per_host={per_host}")
   result = subprocess.run(cmd, capture_output=True, text=True, check=False)
   if result.returncode != 0 or not os.path.exists(executable):
     tail = "\n".join(result.stderr.strip().splitlines()[-5:])

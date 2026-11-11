@@ -47,6 +47,7 @@ what each run needs.
 | `JAX_ENABLE_PGLE` | run 1 only | `1` for the profile-guided recompile that gives the FDO profile; leave it unset in run 2 and the baseline. |
 | `XLA_FLAGS` | run 1 | Keep your usual flags and add `--xla_dump_to=<dump dir> --xla_dump_hlo_pass_re=NO_PASS_DUMPS --xla_gpu_experimental_dump_fdo_profiles=true`. |
 | `XLA_COMPILE_BIN` | `cli aot-build` | Path of the `xla_compile` binary (`build-jax.sh --no-install --extra-targets=@xla//xla/service:xla_compile --extra-target-dest=<dir>` writes `<dir>/bin/xla_compile`). `--xla-compile` overrides it. |
+| `COLLECTIVE_AOT_DEVICES_PER_HOST` | `cli aot-build` | GPUs on each node, e.g. `8`. Decides which collectives the deviceless compile treats as local to a node. Unset assumes one node (all partitions on one host), which is wrong for a multi-node job; set it there. Needs an `xla_compile` with `--num_devices_per_host`. |
 | `PYTHONPATH` | every `cli` command and training | `<maxtext>/src` |
 
 Typical use, with `DUMP`, `OPT` and `BUNDLE` directories:

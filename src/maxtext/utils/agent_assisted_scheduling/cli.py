@@ -35,7 +35,7 @@ COLLECTIVE_HLO_MODE=load. Use it as the first batch of
 moves or as a baseline for an agent to improve.
 
 `aot-build` goes one step further, so the later run does not even compile: it runs `xla_compile` on the optimized
-module (on the attached GPU) and writes a bundle of the executable, the metadata header run 1 saved with
+module (no GPU needed) and writes a bundle of the executable, the metadata header run 1 saved with
 COLLECTIVE_AOT_MODE=dump, and a manifest (aot_bundle.py). Load it with COLLECTIVE_AOT_MODE=load
 COLLECTIVE_AOT_PATH=BUNDLE (aot_executable.py); `aot-check` says whether a bundle is usable.
 

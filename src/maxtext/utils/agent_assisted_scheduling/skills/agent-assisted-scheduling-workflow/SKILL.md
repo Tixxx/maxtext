@@ -11,7 +11,7 @@ Related skills: `xla-gpu-scheduling-heuristics` (what XLA did),
 
 ## Run it from scratch
 
-Three steps. Run 1 and run 2 need the GPUs; step 2 is offline except `aot-build`, which needs one free GPU.
+Three steps. Run 1 and run 2 need the GPUs; step 2 is offline.
 Use the same model, MaxText config, device count and GPU type in both runs. `CLI` below is
 `python -m maxtext.utils.agent_assisted_scheduling.cli`; every command here needs `export PYTHONPATH=<maxtext>/src`
 in the same shell. Typical times for llama3-8b on 8 GPUs: run 1, `aot-build` and run 2 about 1 to 2 minutes each,
@@ -74,11 +74,26 @@ If the header is missing, `COLLECTIVE_AOT_MODE=dump` was not set in run 1: rerun
 2. To check a plan yourself (an agent-written or edited one), run `CLI check-plan
    $DUMP/jit_train_step.post_scheduler.<n>.hlo_module.pb --profile <the profile above> --plan <plan.json>` with the
    highest `n`, then `stamp-plan`. Exit 0 means accepted. Never build a bundle from a rejected plan.
-3. Build the bundle, with no training running on the GPU: `CLI aot-build $DUMP --optimized-module
+3. Build the bundle: `CLI aot-build $DUMP --optimized-module
    $OPT/optimized.hlo_module.pb --out-dir $BUNDLE`. It runs `xla_compile` on the optimized module with run 1's
-   compile config and autotune results, adds run 1's header and writes `manifest.json`. Only this command needs
-   `XLA_COMPILE_BIN`.
+   compile config and autotune results, adds run 1's header and writes writes `manifest.json`. Only this command needs
+   `XLA_COMPILE_BIN`. It needs no GPU: it compiles from run 1's `module_<id>.jit_train_step.gpu_target_config.pbtxt`
+   (written by `--xla_dump_to`) and sets `xla_gpu_cudnn_deviceless_compilation_mode` to `AUTO` in the compile config.
 4. `CLI aot-check $BUNDLE` exits 0 when the bundle is usable and prints the reason when it is not.
+
+**What `aot-build` depends on, and how it fails**
+- cuDNN 9.23 or newer: the deviceless cuDNN graph build requires it.
+- An `xla_compile` that takes `--num_devices_per_host` (a local change to `xla/tools/xla_compile_lib.cc` and
+  `xla/service/xla_compile_main.cc`, not upstream when written). The GPU topology decides which collectives count as
+  local to a node; a stock `xla_compile` assumes one device per host, so no multi-device collective is local. Set
+  `COLLECTIVE_AOT_DEVICES_PER_HOST` to the GPUs per node (`8`) for a multi-node job. Unset, all partitions are assumed
+  to be on one node, which is right only for a single node. Use an `xla_compile` built from the same XLA tree as the
+  jaxlib.
+- If run 2 fails at its first step with `No serialized cuDNN graph with fingerprint ... __cudnn$fmhaSoftmax` (any model
+  with cuDNN fused attention), the bundle was compiled with the cuDNN mode `DISABLED`: run 1's config says so, and a
+  compile with no device then skips building the graphs. `aot-build` overrides it; a hand-run `xla_compile` must too.
+- `aot-check` rejects a bundle built with a different jaxlib version. The version string is date-based, so rebuild after
+  a jaxlib rebuild.
 
 **Step 3: load the optimized module and run (run 2)**
 Run the training command with the same arguments as run 1 (same `BASE_XLA`), except:
@@ -113,6 +128,7 @@ a larger one is a bug. If the step is compute-bound the gain is small even when 
 | `COLLECTIVE_AOT_MODULE` | optional | module the AOT hook handles, default `jit_train_step` |
 | `JAX_ENABLE_PGLE` | run 1 only | profile-guided recompile that yields the profile |
 | `XLA_COMPILE_BIN` | `aot-build` | path of the `xla_compile` binary |
+| `COLLECTIVE_AOT_DEVICES_PER_HOST` | `aot-build` | GPUs per node (e.g. `8`); set it for a multi-node job, unset assumes one node |
 | `PYTHONPATH` | every command | `<maxtext>/src` |
 
 **Redo step 1 when** the model, config, sharding, device count, GPU type, jaxlib or XLA build changes. A bundle from the

@@ -20,7 +20,7 @@ optional: read `xla-hlo-schedule-legality` before proposing an order, and
 ## Inputs
 
 - The **scheduled** HLO module (post-LHS): `*_gpu_after_optimizations.hlo.pb`.
-- The **FDO profile** (`cost_us` by instruction name; PGLE averages per kernel
+- The **FDO profile** (`cost_us` by `<module fingerprint>::<scheduling name>`; PGLE averages per kernel
   launch), as the text XLA dumps with `--xla_gpu_experimental_dump_fdo_profiles`.
 - A profile entry per collective. A collective without one shows
   `[no profile entry]` in `analyze` and its exposure is **unknown, not zero**:
@@ -162,9 +162,15 @@ Not every deficit can be fixed by reordering one computation. Check, in order:
    attention block). Only independent compute can fill it; do not expect it to
    hide behind its own producers or consumers. This applies to any async op,
    priority or not.
-4. **No profile entry.** Entries are keyed by the wrapped root, and cloned
-   instructions (`*.double_buffer_clone`) often have none. These are ignored by
-   the metrics: list them, do not guess.
+4. **No profile entry.** Entries are keyed by the name the scheduler saw
+   (`scheduling_name`, falling back to the wrapped root's) and carry a
+   `<fingerprint>::` prefix that the tooling strips for the module being
+   analyzed. A sync collective renamed after scheduling is still found through
+   its `scheduling_name`. Cloned instructions (`*.double_buffer_clone`) often
+   have no entry. These are ignored by the metrics: list them, do not guess.
+   If *every* collective lacks an entry, suspect keying first (the module's
+   `fingerprint_before_lhs` not matching the profile's prefix, or a profile from
+   a different compile), not the profile run.
 5. **Suspicious latency.** A latency far above its neighbours for the same bytes
    may include cross-rank skew or contention. `analyze` warns when a collective
    is more than 10x the median of its peers and above 5 ms. Say so before building

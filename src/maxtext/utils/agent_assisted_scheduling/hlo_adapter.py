@@ -29,13 +29,15 @@ Approximations, all conservative:
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from maxtext.utils.agent_assisted_scheduling import hlo_text
 from maxtext.utils.agent_assisted_scheduling.legality import Severity, Violation, errors, validate_plan
 from maxtext.utils.agent_assisted_scheduling.plan import IdentityOptions, Plan, verify_against
-from maxtext.utils.agent_assisted_scheduling.profile import Profile
+from maxtext.utils.agent_assisted_scheduling.profile import Profile, module_fingerprint
 from maxtext.utils.agent_assisted_scheduling.schedule_model import (
     AsyncRole,
     Computation,
@@ -95,6 +97,9 @@ _TRIVIAL_FUSED_OPCODES = frozenset(
 
 def _opcode(inst) -> str:
   return hlo_text.opcode_str(inst.opcode.name)
+
+
+_SCHEDULING_NAME_RE = re.compile(r'scheduling_name="([^"]+)"')
 
 
 def _text(inst) -> str:
@@ -172,10 +177,24 @@ class _Loader:
       root = self._root(callee) if callee is not None else None
     return None if root is None else self._unwrap_inst(root)
 
+  def key_of(self, inst) -> str:
+    """Name `inst` is keyed under in the profile: the name the scheduler saw.
+
+    XLA keys costs by `OpMetadata.scheduling_name`, which differs from the final
+    name for instructions renamed after scheduling (e.g. sync collectives).
+    """
+    m = _SCHEDULING_NAME_RE.search(_text(inst))
+    return m.group(1) if m else inst.name
+
   def profile_key(self, start) -> str:
     """Name under which `start`'s latency is keyed in the profile."""
     leaf = self._wrapped_leaf(start)
-    return start.name if leaf is None else leaf.name
+    if leaf is None:
+      return self.key_of(start)
+    key = self.key_of(leaf)
+    # XLA tries the start's own name first, then the wrapped instruction's.
+    own = self.key_of(start)
+    return own if own != key and self.profile.has(own) and not self.profile.has(key) else key
 
   def wrapped_opcode(self, start) -> Optional[str]:
     """Opcode of the wrapped op ("all-gather", "custom-call", ...), None if unknown."""
@@ -188,13 +207,13 @@ class _Loader:
   def cost_us(self, inst, host_copy: bool) -> float:
     if host_copy:
       return 0.0
-    direct = self.profile.cost(inst.name)
+    direct = self.profile.cost(self.key_of(inst))
     if direct:
       return direct
     if _opcode(inst) != "fusion" or "kind=kCustom" not in _text(inst):
       return 0.0
     comp = self._fused_comp(inst)
-    return sum(self.profile.cost(i.name) for i in comp.instructions()) if comp is not None else 0.0
+    return sum(self.profile.cost(self.key_of(i)) for i in comp.instructions()) if comp is not None else 0.0
 
   def trivially_movable(self, inst) -> bool:
     opcode = _opcode(inst)
@@ -290,6 +309,13 @@ def load_module(hlo_module, profile: Optional[Profile] = None, sm_gate_ops: str 
   if sm_gate_ops not in SM_GATE_OPS:
     raise ValueError(f"sm_gate_ops must be one of {SM_GATE_OPS}, not {sm_gate_ops!r}")
   profile = profile or Profile()
+  # XLA prefixes cost names with the module fingerprint; keep this module's costs.
+  try:
+    module_text = hlo_module.to_string()
+  except Exception:
+    module_text = ""
+  raw_profile = profile  # plan identity digests the profile as given, not this view
+  profile = profile.for_module(module_fingerprint(module_text))
   schedule = hlo_module.schedule()
   if schedule is None:
     raise ValueError(f"module {hlo_module.name} is not scheduled")
@@ -318,7 +344,7 @@ def load_module(hlo_module, profile: Optional[Profile] = None, sm_gate_ops: str 
       frozenset(while_bodies),
       handles,
       hlo_module,
-      profile=profile,
+      profile=raw_profile,
   )
 
 
